@@ -1,0 +1,9 @@
+node_modules/
+
+# Live secrets: Slack client secret, and per-user Slack tokens in the DB.
+.env
+worklog.db
+worklog.db-shm
+worklog.db-wal
+
+.DS_Store
