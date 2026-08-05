@@ -4,6 +4,9 @@
 // AI columns are nullable so the tool works fully without any AI configured;
 // ai_themes is JSONB so themes stay queryable rather than being an opaque string.
 
+// Loaded here as well as in server.js: the pool is built at module load, so .env has
+// to be read before this file is evaluated — including when run directly (init-db).
+import 'dotenv/config';
 import pg from 'pg';
 import { randomUUID } from 'node:crypto';
 
@@ -277,7 +280,6 @@ export async function saveDailyLog(payload) {
 
 // Allow running `node src/db.js` to initialize the database.
 if (import.meta.url === `file://${process.argv[1]}`) {
-  await import('dotenv/config');
   await initSchema();
   await pool.end();
 }
