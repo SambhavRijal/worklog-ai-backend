@@ -18,7 +18,7 @@ import express from 'express';
 import cors from 'cors';
 
 import {
-  initSchema, upsertUser, saveUserToken, createSession, getUserBySession,
+  pool, upsertUser, saveUserToken, createSession, getUserBySession,
   saveDailyLog, saveStartLog, getDayLog, savePendingAuth, takePendingAuth,
 } from './db.js';
 import {
@@ -48,9 +48,24 @@ if (!START_HEADER.toLowerCase().includes(MARKER.toLowerCase())) {
   );
 }
 
-await initSchema();
+// Schema creation is a deploy step (`npm run init-db`), not something the server does
+// at boot. Doing it here ran DDL on every serverless cold start, and — worse — a
+// top-level await that rejects stops the module loading at all, so an unreachable
+// database took down every route including /health.
 
-app.get('/health', (_req, res) => res.json({ ok: true }));
+// Deliberately dependency-free so it answers even when the database is down; `db`
+// tells you whether that's the problem.
+app.get('/health', async (_req, res) => {
+  const out = { ok: true };
+  try {
+    await pool.query('SELECT 1');
+    out.db = 'connected';
+  } catch (e) {
+    out.db = 'error';
+    out.dbError = e.message;
+  }
+  res.json(out);
+});
 
 // --- Auth (tab-based OAuth) ---
 //
