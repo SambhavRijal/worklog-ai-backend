@@ -332,5 +332,12 @@ app.post('/day/post', async (req, res) => {
   }
 });
 
-const PORT = process.env.PORT || 8787;
-app.listen(PORT, () => console.log(`WorkLog AI backend on http://localhost:${PORT}`));
+// On a serverless host (Vercel) the platform imports this module and drives the
+// exported handler itself — calling listen() there binds a port nothing routes to.
+// Locally we still want a real server, so only listen when not on Vercel.
+if (!process.env.VERCEL) {
+  const PORT = process.env.PORT || 8787;
+  app.listen(PORT, () => console.log(`WorkLog AI backend on http://localhost:${PORT}`));
+}
+
+export default app;
