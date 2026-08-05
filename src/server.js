@@ -122,14 +122,19 @@ app.get('/auth/slack/callback', async (req, res) => {
 
 // The extension polls this until the callback above has run. One-shot per state.
 app.get('/auth/slack/session', async (req, res) => {
-  const row = await takePendingAuth(req.query.state);
-  if (!row) return res.status(204).end();          // not finished yet
-  if (row.error) return res.status(400).json({ error: row.error });
-  res.json({
-    sessionId: row.session_id,
-    displayName: row.display_name,
-    slackUserId: row.slack_user_id,
-  });
+  try {
+    const row = await takePendingAuth(req.query.state);
+    if (!row) return res.status(204).end();          // not finished yet
+    if (row.error) return res.status(400).json({ error: row.error });
+    res.json({
+      sessionId: row.session_id,
+      displayName: row.display_name,
+      slackUserId: row.slack_user_id,
+    });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // Resolve the acting user + a Slack client for this request, strictly from the
@@ -345,6 +350,18 @@ app.post('/day/post', async (req, res) => {
     console.error(e);
     res.status(500).json({ error: e.message });
   }
+});
+
+// Anything unmatched should say so, not hang.
+app.use((_req, res) => res.status(404).json({ error: 'Not found' }));
+
+// Backstop. Express 4 does NOT forward rejected async handlers here — that's why every
+// route try/catches — but this covers sync throws and anything passed to next(err).
+// Without a response the client waits for the platform timeout instead of an error.
+app.use((err, _req, res, _next) => {
+  console.error(err);
+  if (res.headersSent) return;
+  res.status(500).json({ error: err?.message || 'Internal error' });
 });
 
 // On a serverless host (Vercel) the platform imports this module and drives the
