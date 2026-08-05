@@ -1,6 +1,6 @@
 # WorkLog AI — backend
 
-Node + Express + SQLite. Serves the [extension](../worklog-ai-extension): finishes the
+Node + Express + Postgres. Serves the [extension](../worklog-ai-extension): finishes the
 Slack OAuth handshake, reads and posts to Slack **as each signed-in user**, and stores
 the daily log.
 
@@ -16,6 +16,7 @@ src/
   db.js         SQLite schema + data access
 scripts/
   debug-thread.js   diagnose "daily-updates thread not found"
+  migrate-sqlite-to-postgres.js  one-time import from the old SQLite file
 docs/SLACK_SETUP.md creating the Slack app
 ```
 
@@ -23,9 +24,13 @@ docs/SLACK_SETUP.md creating the Slack app
 
 ```bash
 npm install
-npm run init-db
+# set DATABASE_URL in .env first
+npm run init-db     # creates the tables
 npm start
 ```
+
+Any Postgres works — local, Supabase, Neon, RDS. Use the **direct/session** connection
+string for a long-lived server, not a transaction pooler.
 
 Sanity check: `curl http://localhost:8787/health`
 
@@ -35,6 +40,7 @@ Copy `.env.example` to `.env` and fill it in. The ones that matter:
 
 | Variable | Notes |
 |---|---|
+| `DATABASE_URL` | Postgres connection string. TLS is enabled automatically for non-localhost hosts; set `PGSSL=disable` to force it off. |
 | `PUBLIC_URL` | Where a **browser** can reach this backend. The OAuth redirect is `<PUBLIC_URL>/auth/slack/callback` and must match the Slack app exactly. |
 | `SLACK_CLIENT_ID` / `SLACK_CLIENT_SECRET` | From the Slack app. The **secret belongs only here** — never in the extension. |
 | `START_MARKER` | Phrase identifying a start-work post. |
@@ -74,3 +80,22 @@ deploying, update `PUBLIC_URL` here, plus `BACKEND_URL` and `host_permissions` i
 extension — then re-register the redirect URL in Slack.
 
 Tighten `cors()` in `server.js` to your real origins before exposing it publicly.
+
+## Migrating from the old SQLite build
+
+Carries users (with their Slack tokens, so nobody re-authorises), sessions, and history:
+
+```bash
+npm i -D better-sqlite3        # only needed for the migration
+node scripts/migrate-sqlite-to-postgres.js /path/to/worklog.db
+```
+
+Re-runnable — every insert upserts on a natural key, so a second run updates rather than
+duplicating.
+
+Two things to know:
+
+- **Copy the `-wal` file too.** SQLite in WAL mode keeps recent writes in
+  `worklog.db-wal`; moving only `worklog.db` silently loses them.
+- **Row counts shrink.** `daily_logs` is now `UNIQUE (user_id, date)`, so days that had
+  duplicate rows in the old schema collapse into one. That's the fix, not data loss.

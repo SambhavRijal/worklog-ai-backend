@@ -48,7 +48,7 @@ if (!START_HEADER.toLowerCase().includes(MARKER.toLowerCase())) {
   );
 }
 
-initSchema();
+await initSchema();
 
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
@@ -81,7 +81,7 @@ app.get('/auth/slack/callback', async (req, res) => {
   const { code, state, error } = req.query;
   try {
     if (error) {
-      if (state) savePendingAuth(state, { error: `Slack sign-in was cancelled (${error}).` });
+      if (state) await savePendingAuth(state, { error: `Slack sign-in was cancelled (${error}).` });
       return res.status(400).send(authResultPage({ ok: false, message: 'Sign-in cancelled' }));
     }
     if (!code || !state) {
@@ -91,23 +91,23 @@ app.get('/auth/slack/callback', async (req, res) => {
     const { accessToken, slackUserId } = await exchangeCode({ code, redirectUri: REDIRECT_URI });
     const client = makeClient(accessToken);
     const me = await whoAmI(client);
-    const user = saveUserToken(slackUserId || me.userId, me.user, accessToken);
-    const sessionId = createSession(user.id);
+    const user = await saveUserToken(slackUserId || me.userId, me.user, accessToken);
+    const sessionId = await createSession(user.id);
 
-    savePendingAuth(state, {
+    await savePendingAuth(state, {
       sessionId, displayName: user.display_name, slackUserId: user.slack_user_id,
     });
     res.send(authResultPage({ ok: true, message: `Signed in as ${user.display_name || 'you'}` }));
   } catch (e) {
     console.error(e);
-    if (state) savePendingAuth(state, { error: e.message });
+    if (state) await savePendingAuth(state, { error: e.message });
     res.status(500).send(authResultPage({ ok: false, message: 'Sign-in failed' }));
   }
 });
 
 // The extension polls this until the callback above has run. One-shot per state.
-app.get('/auth/slack/session', (req, res) => {
-  const row = takePendingAuth(req.query.state);
+app.get('/auth/slack/session', async (req, res) => {
+  const row = await takePendingAuth(req.query.state);
   if (!row) return res.status(204).end();          // not finished yet
   if (row.error) return res.status(400).json({ error: row.error });
   res.json({
@@ -119,15 +119,15 @@ app.get('/auth/slack/session', (req, res) => {
 
 // Resolve the acting user + a Slack client for this request, strictly from the
 // signed-in session. There is no fallback token: no session -> no client.
-function resolveClient(req) {
+async function resolveClient(req) {
   const session = req.get('X-Session');
-  const user = getUserBySession(session);
+  const user = await getUserBySession(session);
   if (user?.access_token) return { client: makeClient(user.access_token), user };
   return { client: null, user: null };
 }
 
-function requireAuth(req, res) {
-  const ctx = resolveClient(req);
+async function requireAuth(req, res) {
+  const ctx = await resolveClient(req);
   if (!ctx.client) {
     res.status(401).json({ error: 'Not signed in. Sign in with Slack.' });
     return null;
@@ -137,7 +137,7 @@ function requireAuth(req, res) {
 
 // --- Find today's morning post (any channel) + parsed checklist items ---
 app.get('/day/today', async (req, res) => {
-  const auth = requireAuth(req, res);
+  const auth = await requireAuth(req, res);
   if (!auth) return;
   try {
     const me = await whoAmI(auth.client);
@@ -147,8 +147,8 @@ app.get('/day/today', async (req, res) => {
     // is invisible to it. Two search-free fallbacks before giving up:
     if (!post) {
       // 1. We posted it ourselves — the record (and its items) are already local.
-      const user = auth.user || upsertUser(me.userId, me.user);
-      const local = getDayLog(user.id, todayISO());
+      const user = auth.user || await upsertUser(me.userId, me.user);
+      const local = await getDayLog(user.id, todayISO());
       if (local?.start_post_ts && local.slack_thread_ts) {
         return res.json({
           found: true,
@@ -213,7 +213,7 @@ app.get('/day/today', async (req, res) => {
 
 // --- Check-in: carry forward whatever was still open on the last day worked ---
 app.get('/day/checkin', async (req, res) => {
-  const auth = requireAuth(req, res);
+  const auth = await requireAuth(req, res);
   if (!auth) return;
   try {
     const last = await findLastPost(auth.client, FINISH_HEADER);
@@ -253,7 +253,7 @@ app.get('/day/checkin', async (req, res) => {
 
 // --- Post the reviewed "start work" message (new top-level message) ---
 app.post('/day/start', async (req, res) => {
-  const auth = requireAuth(req, res);
+  const auth = await requireAuth(req, res);
   if (!auth) return;
   try {
     const { channelId, threadTs, items = [] } = req.body;
@@ -269,14 +269,14 @@ app.post('/day/start', async (req, res) => {
     }
 
     const me = await whoAmI(auth.client);
-    const user = auth.user || upsertUser(me.userId, me.user);
+    const user = auth.user || await upsertUser(me.userId, me.user);
 
     const plan = items.map((it) => ({ ...it, status: null })); // plans post without icons
     const text = composeFinishMessage({ header: START_HEADER, items: plan, achievements: '' });
     const blocks = composeFinishBlocks({ header: START_HEADER, items: plan, achievements: '' });
     const posted = await postMessage(auth.client, { channelId, threadTs, text, blocks });
 
-    const logId = saveStartLog({
+    const logId = await saveStartLog({
       user_id: user.id,
       date: todayISO(),
       slack_channel_id: channelId,
@@ -294,7 +294,7 @@ app.post('/day/start', async (req, res) => {
 
 // --- Post the reviewed "finish work" message + store the record ---
 app.post('/day/post', async (req, res) => {
-  const auth = requireAuth(req, res);
+  const auth = await requireAuth(req, res);
   if (!auth) return;
   try {
     const {
@@ -304,7 +304,7 @@ app.post('/day/post', async (req, res) => {
     if (!channelId || !threadTs) return res.status(400).json({ error: 'channelId and threadTs are required' });
 
     const me = await whoAmI(auth.client);
-    const user = auth.user || upsertUser(me.userId, me.user);
+    const user = auth.user || await upsertUser(me.userId, me.user);
 
     // Achievements post only when the user toggled it on. Mood is never posted.
     // Either way, both are stored in the DB below.
@@ -313,7 +313,7 @@ app.post('/day/post', async (req, res) => {
     const blocks = composeFinishBlocks({ header: FINISH_HEADER, items, achievements: ach });
     const posted = await postMessage(auth.client, { channelId, threadTs, text, blocks });
 
-    const logId = saveDailyLog({
+    const logId = await saveDailyLog({
       user_id: user.id,
       date: todayISO(),
       slack_channel_id: channelId,

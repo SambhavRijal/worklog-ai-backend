@@ -9,16 +9,16 @@
 // message (if any) the thread would be taken from. Read-only: posts nothing.
 
 import 'dotenv/config';
-import { db } from '../src/db.js';
+import { pool } from '../src/db.js';
 import { makeClient, findTodayThreadAnchor } from '../src/slack.js';
 
 const MARKER = process.env.START_MARKER || 'before you start work';
 const FINISH_HEADER = process.env.FINISH_HEADER || 'Before you finish work';
 const THREAD_ANCHOR = process.env.THREAD_ANCHOR || 'Please report in this thread';
 
-const user = db
-  .prepare('SELECT * FROM users WHERE access_token IS NOT NULL ORDER BY id DESC LIMIT 1')
-  .get();
+const user = (await pool.query(
+  'SELECT * FROM users WHERE access_token IS NOT NULL ORDER BY id DESC LIMIT 1'
+)).rows[0];
 
 if (!user) {
   console.error('No signed-in user found. Sign in through the extension first.');
@@ -91,3 +91,5 @@ const anchor = await findTodayThreadAnchor(client, {
   preferredChannelId: channelId,
 });
 console.log(anchor ? anchor : 'null — no thread found, check-in would refuse to post');
+
+await pool.end();
