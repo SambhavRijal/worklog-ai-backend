@@ -60,7 +60,7 @@ Copy `.env.example` to `.env` and fill it in. The ones that matter:
 | `GET /auth/jira/session` | Extension polls for the result of its `state` |
 | `GET /jira/status` | Is Jira linked for me? |
 | `POST /jira/disconnect` | Unlink Jira |
-| `GET /jira/today` | My issues whose status changed today |
+| `GET /jira/today` | My sprint sub-tasks (`?mode=checkin` or `checkout`) |
 | `GET /day/checkin` | Items still open on the last day worked, + today's thread |
 | `POST /day/start` | Posts the start-work message into that thread |
 | `GET /day/today` | Today's start-work post + parsed items |
@@ -122,5 +122,22 @@ use, and `callJira()` persists the new one.
 
 Leave the two variables blank to disable Jira: `/jira/status` reports
 `configured: false` and the extension hides the panel.
+
+### What each modal pulls
+
+Both queries are scoped to **open sprints**, **assigned to you**, and **sub-tasks only**
+(`issuetype IN subTaskIssueTypes()`, which covers sub-task bugs too — that's the level
+work is actually tracked at; parent stories are containers).
+
+| Modal | Statuses |
+|---|---|
+| Before you **start** work | To Do, In Progress |
+| Before you **finish** work | In Progress, Review, In QA, Done, Live |
+
+Override with `JIRA_CHECKIN_STATUSES` / `JIRA_CHECKOUT_STATUSES` (comma-separated) if
+your workflow uses different names — they must match Jira exactly.
+
+Sites without Jira Software have no Sprint field, so `openSprints()` is a JQL *error*
+rather than an empty result. The query retries without the sprint clause in that case.
 
 Read-only by design — the granted scopes cannot write to Jira.

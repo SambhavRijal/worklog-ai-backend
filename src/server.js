@@ -13,7 +13,7 @@
 //   GET  /auth/jira/session    -> extension polls for the result of its `state`
 //   GET  /jira/status          -> is Jira linked for me?
 //   POST /jira/disconnect      -> unlink Jira
-//   GET  /jira/today           -> my issues whose status changed today
+//   GET  /jira/today           -> my sprint sub-tasks (?mode=checkin|checkout)
 //   GET  /day/checkin          -> items still open on the last day worked (carry-over)
 //   POST /day/start            -> post the "start work" message + store the record
 //   GET  /day/today            -> find my morning post, return parsed items + thread
@@ -40,7 +40,7 @@ import {
 } from './parse.js';
 import {
   jiraConfigured, jiraAuthUrl, exchangeJiraCode, accessibleResources,
-  jiraMyself, findStoryPointsField, todaysIssues,
+  jiraMyself, findStoryPointsField, issuesForMode,
 } from './jira.js';
 
 const app = express();
@@ -274,7 +274,8 @@ app.post('/jira/disconnect', async (req, res) => {
   }
 });
 
-// Issues assigned to me whose status changed today.
+// Sprint sub-tasks assigned to me. ?mode=checkin returns what's still ahead;
+// ?mode=checkout returns what moved. Defaults to checkout.
 app.get('/jira/today', async (req, res) => {
   const auth = await requireAuth(req, res);
   if (!auth) return;
@@ -295,8 +296,9 @@ app.get('/jira/today', async (req, res) => {
       } catch { /* non-fatal */ }
     }
 
-    const issues = await todaysIssues(conn, { storyPointsField: spField, onTokens });
-    res.json({ connected: true, siteName: conn.site_name, issues });
+    const mode = req.query.mode === 'checkin' ? 'checkin' : 'checkout';
+    const issues = await issuesForMode(conn, { mode, storyPointsField: spField, onTokens });
+    res.json({ connected: true, siteName: conn.site_name, mode, issues });
   } catch (e) {
     if (e.message === 'JIRA_UNAUTHORISED') {
       return res.status(409).json({ error: 'Jira access expired — reconnect Jira in Settings.' });

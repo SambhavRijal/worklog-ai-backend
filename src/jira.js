@@ -120,46 +120,81 @@ export async function findStoryPointsField(conn, opts) {
   return match?.id || null;
 }
 
-// Issues assigned to me whose STATUS changed today — "what did I actually move".
-// `updated` would also catch comments and field edits, which isn't the same thing.
-const TODAY_JQL =
-  'assignee = currentUser() AND status CHANGED AFTER startOfDay() ORDER BY updated DESC';
+// What counts as "mine, in this sprint, worth reporting" — and it differs by mode:
+//   check-in  — what's still ahead: To Do / In Progress
+//   check-out — what moved: In Progress through Live
+//
+// Both are scoped to OPEN SPRINTS and to SUB-TASKS only (including sub-task bugs),
+// because that's the level actual work is tracked at; parent stories are containers.
+// subTaskIssueTypes() is a JQL function, so it picks up whatever the site calls its
+// sub-task types rather than us hardcoding names.
+const DEFAULT_CHECKIN_STATUSES = ['To Do', 'In Progress'];
+const DEFAULT_CHECKOUT_STATUSES = ['In Progress', 'Review', 'In QA', 'Done', 'Live'];
+
+function statusList(envValue, fallback) {
+  const parsed = String(envValue || '').split(',').map((x) => x.trim()).filter(Boolean);
+  return parsed.length ? parsed : fallback;
+}
+
+// Status names contain spaces, so they must be quoted in JQL.
+const jqlString = (v) => `"${String(v).replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+
+export function statusesFor(mode) {
+  return mode === 'checkin'
+    ? statusList(process.env.JIRA_CHECKIN_STATUSES, DEFAULT_CHECKIN_STATUSES)
+    : statusList(process.env.JIRA_CHECKOUT_STATUSES, DEFAULT_CHECKOUT_STATUSES);
+}
+
+export function buildJql(mode, { includeSprint = true } = {}) {
+  const clauses = ['assignee = currentUser()'];
+  if (includeSprint) clauses.push('sprint IN openSprints()');
+  clauses.push('issuetype IN subTaskIssueTypes()');
+  clauses.push(`status IN (${statusesFor(mode).map(jqlString).join(', ')})`);
+  return `${clauses.join(' AND ')} ORDER BY updated DESC`;
+}
 
 // Atlassian replaced POST /search with POST /search/jql; try the new one and fall
 // back so this works on either.
 async function searchIssues(conn, { jql, fields, maxResults = 50, opts }) {
+  const body = { jql, fields, maxResults };
   try {
-    return await callJira(conn, '/rest/api/3/search/jql', {
-      method: 'POST', body: { jql, fields, maxResults }, ...opts,
-    });
+    return await callJira(conn, '/rest/api/3/search/jql', { method: 'POST', body, ...opts });
   } catch (e) {
     if (e.message === 'JIRA_UNAUTHORISED') throw e;
-    return callJira(conn, '/rest/api/3/search', {
-      method: 'POST', body: { jql, fields, maxResults }, ...opts,
-    });
+    return callJira(conn, '/rest/api/3/search', { method: 'POST', body, ...opts });
   }
 }
 
-// Today's issues, normalised for the extension.
-export async function todaysIssues(conn, { storyPointsField, onTokens } = {}) {
+// Sprint-scoped sub-tasks assigned to me, filtered by mode. Normalised for the extension.
+export async function issuesForMode(conn, { mode = 'checkout', storyPointsField, onTokens } = {}) {
   const opts = { onTokens };
   const fields = ['summary', 'status', 'issuetype', 'priority', 'timespent', 'parent'];
   if (storyPointsField) fields.push(storyPointsField);
 
-  const data = await searchIssues(conn, { jql: TODAY_JQL, fields, opts });
-  const site = (conn.site_url || '').replace(/\/$/, '');
+  let data;
+  try {
+    data = await searchIssues(conn, { jql: buildJql(mode), fields, opts });
+  } catch (e) {
+    if (e.message === 'JIRA_UNAUTHORISED') throw e;
+    // Sites without Jira Software have no Sprint field at all, and openSprints()
+    // is then a JQL error rather than an empty result. Retry unscoped so those
+    // teams still get their sub-tasks.
+    data = await searchIssues(conn, { jql: buildJql(mode, { includeSprint: false }), fields, opts });
+  }
 
+  const site = (conn.site_url || '').replace(/\/$/, '');
   return (data?.issues || []).map((i) => {
     const f = i.fields || {};
-    const statusName = f.status?.name || '';
     const category = f.status?.statusCategory?.key || ''; // 'new' | 'indeterminate' | 'done'
     return {
       key: i.key,
       summary: f.summary || '',
-      status: statusName,
+      status: f.status?.name || '',
       statusCategory: category,
       done: category === 'done',
       issueType: f.issuetype?.name || null,
+      parentKey: f.parent?.key || null,
+      parentSummary: f.parent?.fields?.summary || null,
       storyPoints: storyPointsField ? (f[storyPointsField] ?? null) : null,
       timeSpentSeconds: f.timespent ?? null,
       url: site ? `${site}/browse/${i.key}` : null,
