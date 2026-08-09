@@ -8,18 +8,28 @@
 // Endpoints:
 //   GET  /auth/slack/callback  -> Slack redirects here; finishes the OAuth exchange
 //   GET  /auth/slack/session   -> extension collects the session for its `state`
+//   POST /auth/jira/start      -> begin the Jira OAuth round trip (returns authUrl)
+//   GET  /auth/jira/callback   -> Atlassian redirects here; stores the connection
+//   GET  /auth/jira/session    -> extension polls for the result of its `state`
+//   GET  /jira/status          -> is Jira linked for me?
+//   POST /jira/disconnect      -> unlink Jira
+//   GET  /jira/today           -> my issues whose status changed today
 //   GET  /day/checkin          -> items still open on the last day worked (carry-over)
 //   POST /day/start            -> post the "start work" message + store the record
 //   GET  /day/today            -> find my morning post, return parsed items + thread
 //   POST /day/post             -> post the "finish work" reply + store the record
 
 import 'dotenv/config';
+import { randomUUID } from 'node:crypto';
 import express from 'express';
 import cors from 'cors';
 
 import {
   pool, upsertUser, saveUserToken, createSession, getUserBySession,
   saveDailyLog, saveStartLog, getDayLog, savePendingAuth, takePendingAuth,
+  saveJiraConnection, getJiraConnection, deleteJiraConnection, updateJiraTokens,
+  setJiraStoryPointsField, createJiraAuthState, getJiraAuthState,
+  finishJiraAuthState, takeJiraAuthResult,
 } from './db.js';
 import {
   makeClient, exchangeCode, whoAmI, findMorningPost, findLastPost,
@@ -28,6 +38,10 @@ import {
 import {
   parseItems, parseFinishItems, carryOverItems, composeFinishMessage, composeFinishBlocks,
 } from './parse.js';
+import {
+  jiraConfigured, jiraAuthUrl, exchangeJiraCode, accessibleResources,
+  jiraMyself, findStoryPointsField, todaysIssues,
+} from './jira.js';
 
 const app = express();
 app.use(cors());              // dev-friendly; tighten origins for production
@@ -132,6 +146,161 @@ app.get('/auth/slack/session', async (req, res) => {
       slackUserId: row.slack_user_id,
     });
   } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// --- Jira (Atlassian OAuth 3LO) ---
+//
+// The callback arrives straight from Atlassian with none of our headers, so the random
+// `state` — registered against the caller's session before the tab opens — is what ties
+// the round trip back to a user.
+const JIRA_REDIRECT_URI = `${(process.env.PUBLIC_URL || `http://localhost:${process.env.PORT || 8787}`).replace(/\/$/, '')}/auth/jira/callback`;
+
+// Begin the flow: returns the URL for the extension to open in a tab.
+app.post('/auth/jira/start', async (req, res) => {
+  const auth = await requireAuth(req, res);
+  if (!auth) return;
+  try {
+    if (!jiraConfigured()) {
+      return res.status(503).json({ error: 'Jira is not configured on this server (JIRA_CLIENT_ID / JIRA_CLIENT_SECRET).' });
+    }
+    const me = await whoAmI(auth.client);
+    const user = auth.user || await upsertUser(me.userId, me.user);
+    const state = 'jira_' + randomUUID().replace(/-/g, '');
+    await createJiraAuthState(state, user.id);
+    res.json({ state, authUrl: jiraAuthUrl({ redirectUri: JIRA_REDIRECT_URI, state }) });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/auth/jira/callback', async (req, res) => {
+  const { code, state, error, error_description: errDesc } = req.query;
+  try {
+    if (error) {
+      if (state) await finishJiraAuthState(state, errDesc || `Jira authorisation was cancelled (${error}).`);
+      return res.status(400).send(authResultPage({ ok: false, message: 'Jira connection cancelled' }));
+    }
+    if (!code || !state) {
+      return res.status(400).send(authResultPage({ ok: false, message: 'Missing code or state' }));
+    }
+    const pending = await getJiraAuthState(state);
+    if (!pending) {
+      return res.status(400).send(authResultPage({ ok: false, message: 'This link has expired — try again' }));
+    }
+
+    const tok = await exchangeJiraCode({ code, redirectUri: JIRA_REDIRECT_URI });
+    const sites = await accessibleResources(tok.access_token);
+    if (!sites?.length) throw new Error('No Jira sites were granted to this app.');
+    const site = sites[0]; // one site per workspace in practice
+
+    const conn = {
+      cloudId: site.id,
+      siteUrl: site.url,
+      siteName: site.name,
+      accessToken: tok.access_token,
+      refreshToken: tok.refresh_token,
+      expiresAt: new Date(Date.now() + (tok.expires_in || 3600) * 1000).toISOString(),
+    };
+
+    // Best-effort enrichment — a failure here shouldn't lose the connection.
+    const provisional = { ...conn, cloud_id: conn.cloudId, access_token: conn.accessToken };
+    try {
+      const me = await jiraMyself(provisional);
+      conn.accountId = me.accountId;
+      conn.displayName = me.displayName;
+    } catch { /* non-fatal */ }
+    try { conn.storyPointsField = await findStoryPointsField(provisional); } catch { /* non-fatal */ }
+
+    await saveJiraConnection(pending.user_id, conn);
+    await finishJiraAuthState(state, null);
+    res.send(authResultPage({ ok: true, message: `Jira connected — ${site.name}` }));
+  } catch (e) {
+    console.error(e);
+    if (state) await finishJiraAuthState(state, e.message);
+    res.status(500).send(authResultPage({ ok: false, message: 'Jira connection failed' }));
+  }
+});
+
+// Polled by the extension while the tab is open.
+app.get('/auth/jira/session', async (req, res) => {
+  try {
+    const row = await takeJiraAuthResult(req.query.state);
+    if (!row) return res.status(204).end();
+    if (row.error) return res.status(400).json({ error: row.error });
+    const conn = await getJiraConnection(row.user_id);
+    res.json({ connected: true, siteName: conn?.site_name, siteUrl: conn?.site_url, displayName: conn?.display_name });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Is Jira linked for the caller?
+app.get('/jira/status', async (req, res) => {
+  const auth = await requireAuth(req, res);
+  if (!auth) return;
+  try {
+    const me = await whoAmI(auth.client);
+    const user = auth.user || await upsertUser(me.userId, me.user);
+    const conn = await getJiraConnection(user.id);
+    res.json({
+      configured: jiraConfigured(),
+      connected: !!conn,
+      siteName: conn?.site_name || null,
+      siteUrl: conn?.site_url || null,
+      displayName: conn?.display_name || null,
+    });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/jira/disconnect', async (req, res) => {
+  const auth = await requireAuth(req, res);
+  if (!auth) return;
+  try {
+    const me = await whoAmI(auth.client);
+    const user = auth.user || await upsertUser(me.userId, me.user);
+    await deleteJiraConnection(user.id);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Issues assigned to me whose status changed today.
+app.get('/jira/today', async (req, res) => {
+  const auth = await requireAuth(req, res);
+  if (!auth) return;
+  try {
+    const me = await whoAmI(auth.client);
+    const user = auth.user || await upsertUser(me.userId, me.user);
+    const conn = await getJiraConnection(user.id);
+    if (!conn) return res.json({ connected: false, issues: [] });
+
+    const onTokens = (t) => updateJiraTokens(user.id, t);
+
+    // Older connections predate story-point discovery; fill it in once.
+    let spField = conn.story_points_field;
+    if (!spField) {
+      try {
+        spField = await findStoryPointsField(conn, { onTokens });
+        if (spField) await setJiraStoryPointsField(user.id, spField);
+      } catch { /* non-fatal */ }
+    }
+
+    const issues = await todaysIssues(conn, { storyPointsField: spField, onTokens });
+    res.json({ connected: true, siteName: conn.site_name, issues });
+  } catch (e) {
+    if (e.message === 'JIRA_UNAUTHORISED') {
+      return res.status(409).json({ error: 'Jira access expired — reconnect Jira in Settings.' });
+    }
     console.error(e);
     res.status(500).json({ error: e.message });
   }

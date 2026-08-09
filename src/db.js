@@ -78,6 +78,36 @@ export async function initSchema() {
       created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
     );
 
+    -- A user's linked Jira account. Atlassian access tokens expire in ~1 hour, so the
+    -- refresh token is what actually keeps the connection alive; expires_at tells us
+    -- when to use it. story_points_field is discovered per site (the custom field id
+    -- differs between Jira instances).
+    CREATE TABLE IF NOT EXISTS jira_connections (
+      user_id            INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+      cloud_id           TEXT NOT NULL,
+      site_url           TEXT,
+      site_name          TEXT,
+      account_id         TEXT,
+      display_name       TEXT,
+      access_token       TEXT NOT NULL,
+      refresh_token      TEXT,
+      expires_at         TIMESTAMPTZ,
+      story_points_field TEXT,
+      created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at         TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+
+    -- Ties an in-flight Jira OAuth round trip back to the user who started it: the
+    -- callback arrives from Atlassian with no session of ours, so the random state is
+    -- the only link. Rows are short-lived.
+    CREATE TABLE IF NOT EXISTS jira_auth_pending (
+      state      TEXT PRIMARY KEY,
+      user_id    INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      done       BOOLEAN NOT NULL DEFAULT FALSE,
+      error      TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+
     CREATE TABLE IF NOT EXISTS daily_logs (
       id                INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
       user_id           INTEGER REFERENCES users(id) ON DELETE CASCADE,
@@ -187,6 +217,85 @@ export async function getUserBySession(sessionId) {
     `SELECT u.* FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.id = $1`,
     [sessionId]
   );
+}
+
+// --- Jira connection ---
+
+export async function saveJiraConnection(userId, conn) {
+  return one(
+    `INSERT INTO jira_connections
+       (user_id, cloud_id, site_url, site_name, account_id, display_name,
+        access_token, refresh_token, expires_at, story_points_field)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+     ON CONFLICT (user_id) DO UPDATE SET
+       cloud_id = EXCLUDED.cloud_id, site_url = EXCLUDED.site_url,
+       site_name = EXCLUDED.site_name, account_id = EXCLUDED.account_id,
+       display_name = EXCLUDED.display_name, access_token = EXCLUDED.access_token,
+       refresh_token = COALESCE(EXCLUDED.refresh_token, jira_connections.refresh_token),
+       expires_at = EXCLUDED.expires_at,
+       story_points_field = COALESCE(EXCLUDED.story_points_field, jira_connections.story_points_field),
+       updated_at = now()
+     RETURNING *`,
+    [userId, conn.cloudId, conn.siteUrl || null, conn.siteName || null,
+     conn.accountId || null, conn.displayName || null, conn.accessToken,
+     conn.refreshToken || null, conn.expiresAt || null, conn.storyPointsField || null]
+  );
+}
+
+export async function getJiraConnection(userId) {
+  return one('SELECT * FROM jira_connections WHERE user_id = $1', [userId]);
+}
+
+export async function deleteJiraConnection(userId) {
+  await query('DELETE FROM jira_connections WHERE user_id = $1', [userId]);
+}
+
+// Written after a token refresh — the refresh token itself may rotate.
+export async function updateJiraTokens(userId, { accessToken, refreshToken, expiresAt }) {
+  await query(
+    `UPDATE jira_connections
+        SET access_token = $2,
+            refresh_token = COALESCE($3, refresh_token),
+            expires_at = $4,
+            updated_at = now()
+      WHERE user_id = $1`,
+    [userId, accessToken, refreshToken || null, expiresAt || null]
+  );
+}
+
+export async function setJiraStoryPointsField(userId, fieldId) {
+  await query('UPDATE jira_connections SET story_points_field = $2, updated_at = now() WHERE user_id = $1',
+    [userId, fieldId]);
+}
+
+// --- Jira OAuth handshake state ---
+
+export async function createJiraAuthState(state, userId) {
+  await query(`DELETE FROM jira_auth_pending WHERE created_at < now() - interval '15 minutes'`);
+  await query('INSERT INTO jira_auth_pending (state, user_id) VALUES ($1, $2)', [state, userId]);
+}
+
+// Read without consuming — the callback needs to know whose connection this is.
+export async function getJiraAuthState(state) {
+  if (!state) return null;
+  return one(
+    `SELECT * FROM jira_auth_pending
+      WHERE state = $1 AND created_at >= now() - interval '15 minutes'`,
+    [state]
+  );
+}
+
+export async function finishJiraAuthState(state, error = null) {
+  await query('UPDATE jira_auth_pending SET done = TRUE, error = $2 WHERE state = $1', [state, error]);
+}
+
+// Polled by the extension; consumes the row once the callback has finished.
+export async function takeJiraAuthResult(state) {
+  if (!state) return null;
+  const row = await getJiraAuthState(state);
+  if (!row || !row.done) return null;
+  await query('DELETE FROM jira_auth_pending WHERE state = $1', [state]);
+  return row;
 }
 
 // Replace a day's items wholesale — the submitted list is always authoritative.

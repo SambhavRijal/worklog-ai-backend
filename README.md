@@ -55,6 +55,12 @@ Copy `.env.example` to `.env` and fill it in. The ones that matter:
 |---|---|
 | `GET /auth/slack/callback` | Slack redirects here; finishes the OAuth exchange |
 | `GET /auth/slack/session` | Extension collects the session for its `state` (one-shot) |
+| `POST /auth/jira/start` | Begin the Jira OAuth round trip (returns `authUrl`) |
+| `GET /auth/jira/callback` | Atlassian redirects here; stores the connection |
+| `GET /auth/jira/session` | Extension polls for the result of its `state` |
+| `GET /jira/status` | Is Jira linked for me? |
+| `POST /jira/disconnect` | Unlink Jira |
+| `GET /jira/today` | My issues whose status changed today |
 | `GET /day/checkin` | Items still open on the last day worked, + today's thread |
 | `POST /day/start` | Posts the start-work message into that thread |
 | `GET /day/today` | Today's start-work post + parsed items |
@@ -99,3 +105,22 @@ Two things to know:
   `worklog.db-wal`; moving only `worklog.db` silently loses them.
 - **Row counts shrink.** `daily_logs` is now `UNIQUE (user_id, date)`, so days that had
   duplicate rows in the old schema collapse into one. That's the fix, not data loss.
+
+## Jira (optional)
+
+Create an OAuth 2.0 (3LO) app at
+[developer.atlassian.com/console/myapps](https://developer.atlassian.com/console/myapps/):
+
+1. **Permissions → Jira API** → add `read:jira-work` and `read:jira-user`
+2. **Authorization → OAuth 2.0 (3LO)** → callback URL `<PUBLIC_URL>/auth/jira/callback`
+3. **Settings → Authentication details** → copy the client ID and secret into
+   `JIRA_CLIENT_ID` / `JIRA_CLIENT_SECRET`
+
+`offline_access` is requested automatically — without it the connection would die after
+an hour, since Atlassian access tokens are short-lived. Refresh tokens rotate on every
+use, and `callJira()` persists the new one.
+
+Leave the two variables blank to disable Jira: `/jira/status` reports
+`configured: false` and the extension hides the panel.
+
+Read-only by design — the granted scopes cannot write to Jira.
