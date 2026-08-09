@@ -49,8 +49,9 @@ async function tx(fn) {
   }
 }
 
-export async function initSchema() {
-  await query(`
+// The full schema, exported so it can be printed for pasting into a SQL console
+// (Supabase's SQL Editor, psql) — one definition, no hand-copied drift.
+export const SCHEMA_SQL = `
     CREATE TABLE IF NOT EXISTS users (
       id            INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
       slack_user_id TEXT UNIQUE,
@@ -151,7 +152,10 @@ export async function initSchema() {
     CREATE INDEX IF NOT EXISTS idx_daily_logs_user_date ON daily_logs (user_id, date DESC);
     CREATE INDEX IF NOT EXISTS idx_log_items_log ON log_items (daily_log_id, "order");
     CREATE INDEX IF NOT EXISTS idx_pending_auth_created ON pending_auth (created_at);
-  `);
+`;
+
+export async function initSchema() {
+  await query(SCHEMA_SQL);
   console.log('Schema ready on Postgres');
 }
 
