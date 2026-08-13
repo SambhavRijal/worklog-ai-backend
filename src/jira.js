@@ -121,8 +121,12 @@ export async function findStoryPointsField(conn, opts) {
 }
 
 // What counts as "mine, in this sprint, worth reporting" — and it differs by mode:
-//   check-in  — what's still ahead: To Do / In Progress
-//   check-out — what moved: In Progress through Live
+//   check-in  — what's still ahead: To Do / In Progress, whenever it last moved
+//   check-out — what moved TODAY: In Progress through Live, and status changed today
+//
+// Check-out needs the date filter or you get the sprint's entire Done column every
+// evening instead of the handful you actually finished. Check-in deliberately has no
+// date filter: what's still on your plate doesn't depend on when it last changed.
 //
 // Both are scoped to OPEN SPRINTS and to SUB-TASKS only (including sub-task bugs),
 // because that's the level actual work is tracked at; parent stories are containers.
@@ -150,6 +154,8 @@ export function buildJql(mode, { includeSprint = true } = {}) {
   if (includeSprint) clauses.push('sprint IN openSprints()');
   clauses.push('issuetype IN subTaskIssueTypes()');
   clauses.push(`status IN (${statusesFor(mode).map(jqlString).join(', ')})`);
+  // startOfDay() resolves in the Jira user's own timezone, which is what you want.
+  if (mode !== 'checkin') clauses.push('status CHANGED AFTER startOfDay()');
   return `${clauses.join(' AND ')} ORDER BY updated DESC`;
 }
 

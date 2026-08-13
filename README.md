@@ -129,10 +129,14 @@ Both queries are scoped to **open sprints**, **assigned to you**, and **sub-task
 (`issuetype IN subTaskIssueTypes()`, which covers sub-task bugs too — that's the level
 work is actually tracked at; parent stories are containers).
 
-| Modal | Statuses |
-|---|---|
-| Before you **start** work | To Do, In Progress |
-| Before you **finish** work | In Progress, Review, In QA, Done, Live |
+| Modal | Statuses | Time filter |
+|---|---|---|
+| Before you **start** work | To Do, In Progress | none — what's on your plate doesn't depend on when it last moved |
+| Before you **finish** work | In Progress, Review, In QA, Done, Live | `status CHANGED AFTER startOfDay()` |
+
+Check-out needs that filter or you get the sprint's entire Done column every evening
+instead of the few you actually finished. `startOfDay()` resolves in the Jira user's own
+timezone.
 
 Override with `JIRA_CHECKIN_STATUSES` / `JIRA_CHECKOUT_STATUSES` (comma-separated) if
 your workflow uses different names — they must match Jira exactly.
