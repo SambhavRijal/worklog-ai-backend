@@ -111,6 +111,34 @@ export function jiraMyself(conn, opts) {
   return callJira(conn, '/rest/api/3/myself', opts);
 }
 
+// Which issue types count as "the level work is tracked at"?
+//
+// subTaskIssueTypes() only matches types Jira has FLAGGED as sub-tasks. A type named
+// e.g. "Subtask Bug" that was configured as a standard type is silently excluded by it,
+// which looks exactly like "no issues today". So discover the real names instead:
+// anything flagged subtask, plus anything whose name reads sub-task-ish.
+// Every issue type on the site, with Jira's own subtask flag — for diagnostics.
+export async function listIssueTypes(conn, opts) {
+  const types = await callJira(conn, '/rest/api/3/issuetype', opts);
+  const seen = new Map();
+  for (const t of types || []) {
+    const name = (t.name || '').trim();
+    if (name && !seen.has(name)) seen.set(name, { name, subtask: t.subtask === true });
+  }
+  return [...seen.values()];
+}
+
+export async function findSubtaskIssueTypes(conn, opts) {
+  const types = await callJira(conn, '/rest/api/3/issuetype', opts);
+  const names = new Set();
+  for (const t of types || []) {
+    const name = (t.name || '').trim();
+    if (!name) continue;
+    if (t.subtask === true || /sub[\s_-]*task/i.test(name)) names.add(name);
+  }
+  return [...names];
+}
+
 // Story points live in a custom field whose id differs per site, so find it by name.
 export async function findStoryPointsField(conn, opts) {
   const fields = await callJira(conn, '/rest/api/3/field', opts);
@@ -149,10 +177,14 @@ export function statusesFor(mode) {
     : statusList(process.env.JIRA_CHECKOUT_STATUSES, DEFAULT_CHECKOUT_STATUSES);
 }
 
-export function buildJql(mode, { includeSprint = true } = {}) {
+export function buildJql(mode, { includeSprint = true, issueTypes = null } = {}) {
   const clauses = ['assignee = currentUser()'];
   if (includeSprint) clauses.push('sprint IN openSprints()');
-  clauses.push('issuetype IN subTaskIssueTypes()');
+  // Explicit names when we've discovered them (a superset of subTaskIssueTypes()),
+  // otherwise fall back to the JQL function.
+  clauses.push(issueTypes?.length
+    ? `issuetype IN (${issueTypes.map(jqlString).join(', ')})`
+    : 'issuetype IN subTaskIssueTypes()');
   clauses.push(`status IN (${statusesFor(mode).map(jqlString).join(', ')})`);
   // startOfDay() resolves in the Jira user's own timezone, which is what you want.
   if (mode !== 'checkin') clauses.push('status CHANGED AFTER startOfDay()');
@@ -171,21 +203,53 @@ async function searchIssues(conn, { jql, fields, maxResults = 50, opts }) {
   }
 }
 
+// A few of my issues with their REAL type and status names — the fastest way to see
+// why a status/type filter matches nothing (e.g. "In progress" vs "In Progress",
+// or a bug type that isn't flagged as a sub-task).
+export async function sampleMine(conn, opts, { limit = 15 } = {}) {
+  const jql = 'assignee = currentUser() AND sprint IN openSprints() ORDER BY updated DESC';
+  try {
+    const r = await searchIssues(conn, {
+      jql, fields: ['summary', 'status', 'issuetype', 'parent'], maxResults: limit, opts,
+    });
+    return (r?.issues || []).map((i) => ({
+      key: i.key,
+      type: i.fields?.issuetype?.name || null,
+      isSubtaskType: i.fields?.issuetype?.subtask === true,
+      status: i.fields?.status?.name || null,
+      category: i.fields?.status?.statusCategory?.key || null,
+      hasParent: !!i.fields?.parent,
+    }));
+  } catch (e) {
+    return `error: ${e.message.slice(0, 160)}`;
+  }
+}
+
+// How many issues a JQL matches, without pulling their fields. Used by /jira/probe.
+export async function countFor(conn, jql, opts) {
+  try {
+    const r = await searchIssues(conn, { jql, fields: ['summary'], maxResults: 1, opts });
+    return r?.total ?? (r?.issues?.length ?? 0);
+  } catch (e) {
+    return `error: ${e.message.slice(0, 120)}`;
+  }
+}
+
 // Sprint-scoped sub-tasks assigned to me, filtered by mode. Normalised for the extension.
-export async function issuesForMode(conn, { mode = 'checkout', storyPointsField, onTokens } = {}) {
+export async function issuesForMode(conn, { mode = 'checkout', storyPointsField, issueTypes, onTokens } = {}) {
   const opts = { onTokens };
   const fields = ['summary', 'status', 'issuetype', 'priority', 'timespent', 'parent'];
   if (storyPointsField) fields.push(storyPointsField);
 
   let data;
   try {
-    data = await searchIssues(conn, { jql: buildJql(mode), fields, opts });
+    data = await searchIssues(conn, { jql: buildJql(mode, { issueTypes }), fields, opts });
   } catch (e) {
     if (e.message === 'JIRA_UNAUTHORISED') throw e;
     // Sites without Jira Software have no Sprint field at all, and openSprints()
     // is then a JQL error rather than an empty result. Retry unscoped so those
     // teams still get their sub-tasks.
-    data = await searchIssues(conn, { jql: buildJql(mode, { includeSprint: false }), fields, opts });
+    data = await searchIssues(conn, { jql: buildJql(mode, { includeSprint: false, issueTypes }), fields, opts });
   }
 
   const site = (conn.site_url || '').replace(/\/$/, '');

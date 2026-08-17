@@ -152,6 +152,10 @@ export const SCHEMA_SQL = `
     CREATE INDEX IF NOT EXISTS idx_daily_logs_user_date ON daily_logs (user_id, date DESC);
     CREATE INDEX IF NOT EXISTS idx_log_items_log ON log_items (daily_log_id, "order");
     CREATE INDEX IF NOT EXISTS idx_pending_auth_created ON pending_auth (created_at);
+
+    -- Added after the table shipped, so it needs an explicit ALTER: CREATE TABLE
+    -- IF NOT EXISTS won't add columns to a table that already exists.
+    ALTER TABLE jira_connections ADD COLUMN IF NOT EXISTS issue_types TEXT;
 `;
 
 export async function initSchema() {
@@ -265,6 +269,12 @@ export async function updateJiraTokens(userId, { accessToken, refreshToken, expi
       WHERE user_id = $1`,
     [userId, accessToken, refreshToken || null, expiresAt || null]
   );
+}
+
+// Cached comma-separated issue-type names that count as sub-task-ish on this site.
+export async function setJiraIssueTypes(userId, names) {
+  await query('UPDATE jira_connections SET issue_types = $2, updated_at = now() WHERE user_id = $1',
+    [userId, (names || []).join(',') || null]);
 }
 
 export async function setJiraStoryPointsField(userId, fieldId) {

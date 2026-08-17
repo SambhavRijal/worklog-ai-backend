@@ -14,6 +14,7 @@
 //   GET  /jira/status          -> is Jira linked for me?
 //   POST /jira/disconnect      -> unlink Jira
 //   GET  /jira/today           -> my sprint sub-tasks (?mode=checkin|checkout)
+//   GET  /jira/probe           -> diagnose an empty panel (names + per-clause counts)
 //   GET  /day/checkin          -> items still open on the last day worked (carry-over)
 //   POST /day/start            -> post the "start work" message + store the record
 //   GET  /day/today            -> find my morning post, return parsed items + thread
@@ -28,7 +29,7 @@ import {
   pool, upsertUser, saveUserToken, createSession, getUserBySession,
   saveDailyLog, saveStartLog, getDayLog, savePendingAuth, takePendingAuth,
   saveJiraConnection, getJiraConnection, deleteJiraConnection, updateJiraTokens,
-  setJiraStoryPointsField, createJiraAuthState, getJiraAuthState,
+  setJiraStoryPointsField, setJiraIssueTypes, createJiraAuthState, getJiraAuthState,
   finishJiraAuthState, takeJiraAuthResult,
 } from './db.js';
 import {
@@ -40,7 +41,8 @@ import {
 } from './parse.js';
 import {
   jiraConfigured, jiraAuthUrl, exchangeJiraCode, accessibleResources,
-  jiraMyself, findStoryPointsField, issuesForMode,
+  jiraMyself, findStoryPointsField, findSubtaskIssueTypes, listIssueTypes, issuesForMode,
+  buildJql, statusesFor, countFor, sampleMine,
 } from './jira.js';
 
 const app = express();
@@ -296,13 +298,73 @@ app.get('/jira/today', async (req, res) => {
       } catch { /* non-fatal */ }
     }
 
+    // Which issue types count as sub-task-ish here. Discovered once per connection
+    // because subTaskIssueTypes() misses types that merely LOOK like sub-tasks.
+    let issueTypes = (conn.issue_types || '').split(',').map((x) => x.trim()).filter(Boolean);
+    if (!issueTypes.length) {
+      try {
+        issueTypes = await findSubtaskIssueTypes(conn, { onTokens });
+        if (issueTypes.length) await setJiraIssueTypes(user.id, issueTypes);
+      } catch { /* fall back to subTaskIssueTypes() in the JQL */ }
+    }
+
     const mode = req.query.mode === 'checkin' ? 'checkin' : 'checkout';
-    const issues = await issuesForMode(conn, { mode, storyPointsField: spField, onTokens });
-    res.json({ connected: true, siteName: conn.site_name, mode, issues });
+    const issues = await issuesForMode(conn, { mode, storyPointsField: spField, issueTypes, onTokens });
+    res.json({ connected: true, siteName: conn.site_name, mode, issueTypes, issues });
   } catch (e) {
     if (e.message === 'JIRA_UNAUTHORISED') {
       return res.status(409).json({ error: 'Jira access expired — reconnect Jira in Settings.' });
     }
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Diagnose an empty panel: reports what this site actually calls things, and how many
+// issues each clause of the query matches. Read-only; nothing is written to Jira.
+app.get('/jira/probe', async (req, res) => {
+  const auth = await requireAuth(req, res);
+  if (!auth) return;
+  try {
+    const me = await whoAmI(auth.client);
+    const user = auth.user || await upsertUser(me.userId, me.user);
+    const conn = await getJiraConnection(user.id);
+    if (!conn) return res.json({ connected: false });
+    const onTokens = (t) => updateJiraTokens(user.id, t);
+    const opts = { onTokens };
+
+    const out = { connected: true, site: conn.site_name };
+    try { out.jiraUser = (await jiraMyself(conn, opts))?.displayName; } catch (e) { out.jiraUser = 'error: ' + e.message; }
+    try {
+      out.allIssueTypes = await listIssueTypes(conn, opts);
+    } catch (e) { out.allIssueTypes = 'error: ' + e.message; }
+    try { out.discoveredSubtaskTypes = await findSubtaskIssueTypes(conn, opts); }
+    catch (e) { out.discoveredSubtaskTypes = 'error: ' + e.message; }
+    out.cachedIssueTypes = conn.issue_types || null;
+    out.checkinStatuses = statusesFor('checkin');
+    out.checkoutStatuses = statusesFor('checkout');
+
+    const it = (out.discoveredSubtaskTypes instanceof Array) ? out.discoveredSubtaskTypes : null;
+    // Narrow one clause at a time so the first zero tells you which clause is wrong.
+    out.counts = {
+      'assignee only': await countFor(conn, 'assignee = currentUser()', opts),
+      'assignee + openSprints': await countFor(conn, 'assignee = currentUser() AND sprint IN openSprints()', opts),
+      'assignee + subTaskIssueTypes()': await countFor(conn, 'assignee = currentUser() AND issuetype IN subTaskIssueTypes()', opts),
+      'assignee + discovered types': it?.length
+        ? await countFor(conn, `assignee = currentUser() AND issuetype IN (${it.map((n) => JSON.stringify(n)).join(', ')})`, opts)
+        : 'n/a',
+      'assignee + changed today': await countFor(conn, 'assignee = currentUser() AND status CHANGED AFTER startOfDay()', opts),
+      'full checkin jql': await countFor(conn, buildJql('checkin', { issueTypes: it }), opts),
+      'full checkout jql': await countFor(conn, buildJql('checkout', { issueTypes: it }), opts),
+    };
+    out.jql = {
+      checkin: buildJql('checkin', { issueTypes: it }),
+      checkout: buildJql('checkout', { issueTypes: it }),
+    };
+    // The decisive bit: what your issues are ACTUALLY called.
+    out.sample = await sampleMine(conn, opts);
+    res.json(out);
+  } catch (e) {
     console.error(e);
     res.status(500).json({ error: e.message });
   }
