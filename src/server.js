@@ -14,6 +14,8 @@
 //   GET  /jira/status          -> is Jira linked for me?
 //   POST /jira/disconnect      -> unlink Jira
 //   GET  /jira/today           -> my sprint sub-tasks (?mode=checkin|checkout)
+//   GET  /jira/sites           -> which Jira sites this account granted us
+//   POST /jira/site            -> switch which granted site we query
 //   GET  /jira/probe           -> diagnose an empty panel (names + per-clause counts)
 //   GET  /day/checkin          -> items still open on the last day worked (carry-over)
 //   POST /day/start            -> post the "start work" message + store the record
@@ -197,7 +199,17 @@ app.get('/auth/jira/callback', async (req, res) => {
     const tok = await exchangeJiraCode({ code, redirectUri: JIRA_REDIRECT_URI });
     const sites = await accessibleResources(tok.access_token);
     if (!sites?.length) throw new Error('No Jira sites were granted to this app.');
-    const site = sites[0]; // one site per workspace in practice
+    // An Atlassian account can have SEVERAL sites (jobinsv1, jobinsv2 …). Taking the
+    // first silently queries the wrong Jira: valid JQL, correct token, zero results.
+    // JIRA_SITE picks by name or URL substring; otherwise fall back to the first.
+    const want = (process.env.JIRA_SITE || '').trim().toLowerCase();
+    const site = (want && sites.find((s) =>
+      (s.name || '').toLowerCase().includes(want) || (s.url || '').toLowerCase().includes(want)
+    )) || sites[0];
+    if (sites.length > 1 && !want) {
+      console.warn(`Multiple Jira sites granted (${sites.map((s) => s.name).join(', ')}); ` +
+                   `defaulting to "${site.name}". Set JIRA_SITE to choose.`);
+    }
 
     const conn = {
       cloudId: site.id,
@@ -320,6 +332,59 @@ app.get('/jira/today', async (req, res) => {
   }
 });
 
+// Which Jira sites did this user grant us?
+app.get('/jira/sites', async (req, res) => {
+  const auth = await requireAuth(req, res);
+  if (!auth) return;
+  try {
+    const me = await whoAmI(auth.client);
+    const user = auth.user || await upsertUser(me.userId, me.user);
+    const conn = await getJiraConnection(user.id);
+    if (!conn) return res.json({ connected: false, sites: [] });
+    const sites = await accessibleResources(conn.access_token);
+    res.json({
+      connected: true,
+      current: { cloudId: conn.cloud_id, name: conn.site_name, url: conn.site_url },
+      sites: (sites || []).map((s) => ({ cloudId: s.id, name: s.name, url: s.url })),
+    });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Switch which granted site we query, without redoing the OAuth dance.
+app.post('/jira/site', async (req, res) => {
+  const auth = await requireAuth(req, res);
+  if (!auth) return;
+  try {
+    const { cloudId } = req.body || {};
+    if (!cloudId) return res.status(400).json({ error: 'cloudId is required' });
+    const me = await whoAmI(auth.client);
+    const user = auth.user || await upsertUser(me.userId, me.user);
+    const conn = await getJiraConnection(user.id);
+    if (!conn) return res.status(400).json({ error: 'Jira is not connected.' });
+
+    const sites = await accessibleResources(conn.access_token);
+    const site = (sites || []).find((s) => s.id === cloudId);
+    if (!site) return res.status(400).json({ error: 'That site was not granted to this app.' });
+
+    await saveJiraConnection(user.id, {
+      cloudId: site.id, siteUrl: site.url, siteName: site.name,
+      accountId: conn.account_id, displayName: conn.display_name,
+      accessToken: conn.access_token, refreshToken: conn.refresh_token,
+      expiresAt: conn.expires_at,
+      storyPointsField: null,   // these are per-site; rediscover for the new one
+    });
+    await setJiraIssueTypes(user.id, []);
+    await setJiraStoryPointsField(user.id, null);
+    res.json({ ok: true, siteName: site.name, siteUrl: site.url });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // Diagnose an empty panel: reports what this site actually calls things, and how many
 // issues each clause of the query matches. Read-only; nothing is written to Jira.
 app.get('/jira/probe', async (req, res) => {
@@ -333,7 +398,11 @@ app.get('/jira/probe', async (req, res) => {
     const onTokens = (t) => updateJiraTokens(user.id, t);
     const opts = { onTokens };
 
-    const out = { connected: true, site: conn.site_name };
+    const out = { connected: true, site: conn.site_name, siteUrl: conn.site_url, cloudId: conn.cloud_id };
+    try {
+      out.grantedSites = (await accessibleResources(conn.access_token))
+        .map((s) => ({ cloudId: s.id, name: s.name, url: s.url, current: s.id === conn.cloud_id }));
+    } catch (e) { out.grantedSites = 'error: ' + e.message; }
     try { out.jiraUser = (await jiraMyself(conn, opts))?.displayName; } catch (e) { out.jiraUser = 'error: ' + e.message; }
     try {
       out.allIssueTypes = await listIssueTypes(conn, opts);
