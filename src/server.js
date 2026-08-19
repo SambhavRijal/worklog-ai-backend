@@ -44,7 +44,7 @@ import {
 import {
   jiraConfigured, jiraAuthUrl, exchangeJiraCode, accessibleResources,
   jiraMyself, findStoryPointsField, findSubtaskIssueTypes, listIssueTypes, issuesForMode,
-  buildJql, statusesFor, countFor, sampleMine,
+  buildJql, statusesFor, countFor, sampleMine, runJql,
 } from './jira.js';
 
 const app = express();
@@ -398,6 +398,12 @@ app.get('/jira/probe', async (req, res) => {
     const onTokens = (t) => updateJiraTokens(user.id, t);
     const opts = { onTokens };
 
+    // ?jql=... runs exactly that query and returns nothing else, so a failing
+    // clause can be bisected without a redeploy per attempt.
+    if (req.query.jql) {
+      return res.json({ jql: req.query.jql, ...(await runJql(conn, String(req.query.jql), opts)) });
+    }
+
     const out = { connected: true, site: conn.site_name, siteUrl: conn.site_url, cloudId: conn.cloud_id };
     try {
       out.grantedSites = (await accessibleResources(conn.access_token))
@@ -423,6 +429,11 @@ app.get('/jira/probe', async (req, res) => {
         ? await countFor(conn, `assignee = currentUser() AND issuetype IN (${it.map((n) => JSON.stringify(n)).join(', ')})`, opts)
         : 'n/a',
       'assignee + changed today': await countFor(conn, 'assignee = currentUser() AND status CHANGED AFTER startOfDay()', opts),
+      'assignee + status To Do': await countFor(conn, 'assignee = currentUser() AND status = "To Do"', opts),
+      'assignee + status IN checkin': await countFor(conn, `assignee = currentUser() AND status IN (${statusesFor('checkin').map((n) => JSON.stringify(n)).join(', ')})`, opts),
+      'assignee + sprint + types': it?.length
+        ? await countFor(conn, `assignee = currentUser() AND sprint IN openSprints() AND issuetype IN (${it.map((n) => JSON.stringify(n)).join(', ')})`, opts)
+        : 'n/a',
       'full checkin jql': await countFor(conn, buildJql('checkin', { issueTypes: it }), opts),
       'full checkout jql': await countFor(conn, buildJql('checkout', { issueTypes: it }), opts),
     };

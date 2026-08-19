@@ -225,13 +225,34 @@ export async function sampleMine(conn, opts, { limit = 15 } = {}) {
   }
 }
 
-// How many issues a JQL matches, without pulling their fields. Used by /jira/probe.
-export async function countFor(conn, jql, opts) {
+// How many issues a JQL matches. Atlassian's newer /search/jql omits `total`, so
+// asking for one row and reading issues.length silently reports 1 for everything —
+// count the rows instead, capped.
+export async function countFor(conn, jql, opts, { cap = 100 } = {}) {
   try {
-    const r = await searchIssues(conn, { jql, fields: ['summary'], maxResults: 1, opts });
-    return r?.total ?? (r?.issues?.length ?? 0);
+    const r = await searchIssues(conn, { jql, fields: ['summary'], maxResults: cap, opts });
+    const n = r?.issues?.length ?? 0;
+    return n >= cap ? `${cap}+` : n;
   } catch (e) {
-    return `error: ${e.message.slice(0, 120)}`;
+    return `error: ${e.message.slice(0, 160)}`;
+  }
+}
+
+// Run one arbitrary JQL and show what comes back — for bisecting a query that
+// matches nothing. Read-only.
+export async function runJql(conn, jql, opts, { limit = 10 } = {}) {
+  try {
+    const r = await searchIssues(conn, {
+      jql, fields: ['summary', 'status', 'issuetype'], maxResults: limit, opts,
+    });
+    return {
+      matched: r?.issues?.length ?? 0,
+      issues: (r?.issues || []).map((i) => ({
+        key: i.key, type: i.fields?.issuetype?.name, status: i.fields?.status?.name,
+      })),
+    };
+  } catch (e) {
+    return { error: e.message.slice(0, 300) };
   }
 }
 
