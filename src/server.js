@@ -22,6 +22,7 @@
 //   POST /day/start            -> post the "start work" message + store the record
 //   GET  /day/today            -> find my morning post, return parsed items + thread
 //   POST /day/post             -> post the "finish work" reply + store the record
+//   POST /me/delete            -> erase everything stored for the caller
 
 import 'dotenv/config';
 import { randomUUID } from 'node:crypto';
@@ -33,7 +34,7 @@ import {
   saveDailyLog, saveStartLog, getDayLog, savePendingAuth, takePendingAuth,
   saveJiraConnection, getJiraConnection, deleteJiraConnection, updateJiraTokens,
   setJiraStoryPointsField, setJiraIssueTypes, createJiraAuthState, getJiraAuthState,
-  finishJiraAuthState, takeJiraAuthResult,
+  finishJiraAuthState, takeJiraAuthResult, deleteUserData,
 } from './db.js';
 import {
   makeClient, exchangeCode, whoAmI, findMorningPost, findLastPost,
@@ -150,9 +151,11 @@ app.get('/privacy', (_req, res) => {
   <h2>Retention and removal</h2>
   <ul>
     <li><b>Disconnecting Jira</b> in the extension's settings deletes your Jira tokens immediately.</li>
-    <li><b>Signing out</b> removes the session from your browser. Your stored Slack token and
-        daily log remain on the server until deleted — email the contact below to have
-        your data removed.</li>
+    <li><b>Delete my data</b>, in the extension's settings, erases everything listed above
+        — tokens, sessions and your whole daily-log history — and revokes the Slack token.
+        This is immediate and cannot be undone.</li>
+    <li><b>Signing out</b> only removes the session from your browser; it does not delete
+        server-side data. Use <b>Delete my data</b> for that.</li>
     <li>You can also revoke access at any time from Slack and from your Atlassian account settings.</li>
   </ul>
 
@@ -550,6 +553,27 @@ app.get('/jira/probe', async (req, res) => {
     // The decisive bit: what your issues are ACTUALLY called.
     out.sample = await sampleMine(conn, opts);
     res.json(out);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Delete everything this backend holds for the caller. Irreversible by design — the
+// privacy policy promises it, so it has to actually do it rather than just log out.
+app.post('/me/delete', async (req, res) => {
+  const auth = await requireAuth(req, res);
+  if (!auth) return;
+  try {
+    const me = await whoAmI(auth.client);
+    const user = auth.user || await upsertUser(me.userId, me.user);
+
+    // Best effort: hand the Slack token back before dropping it, so it stops working
+    // even if a copy leaked. A failure here must not block the deletion.
+    try { await auth.client.auth.revoke(); } catch { /* revoking is a courtesy */ }
+
+    const removed = await deleteUserData(user.id);
+    res.json({ ok: true, removed });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: e.message });

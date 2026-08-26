@@ -227,6 +227,21 @@ export async function getUserBySession(sessionId) {
   );
 }
 
+// Remove everything belonging to a user. sessions, daily_logs, log_items and
+// jira_connections are all ON DELETE CASCADE from users, so one delete clears the lot.
+// Returns what was removed, so the caller can report it honestly.
+export async function deleteUserData(userId) {
+  const counts = {};
+  for (const t of ['jira_connections', 'sessions', 'log_items', 'daily_logs']) {
+    const sql = t === 'log_items'
+      ? 'SELECT COUNT(*)::int AS n FROM log_items WHERE daily_log_id IN (SELECT id FROM daily_logs WHERE user_id = $1)'
+      : `SELECT COUNT(*)::int AS n FROM ${t} WHERE user_id = $1`;
+    counts[t] = (await one(sql, [userId]))?.n ?? 0;
+  }
+  await query('DELETE FROM users WHERE id = $1', [userId]);
+  return counts;
+}
+
 // --- Jira connection ---
 
 export async function saveJiraConnection(userId, conn) {
