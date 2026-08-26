@@ -6,6 +6,7 @@
 //        an unauthenticated request is rejected, never silently attributed to someone.
 //
 // Endpoints:
+//   GET  /privacy, /terms      -> public policy pages (Atlassian requires these)
 //   GET  /auth/slack/callback  -> Slack redirects here; finishes the OAuth exchange
 //   GET  /auth/slack/session   -> extension collects the session for its `state`
 //   POST /auth/jira/start      -> begin the Jira OAuth round trip (returns authUrl)
@@ -83,6 +84,111 @@ app.get('/health', async (_req, res) => {
     out.dbError = e.message;
   }
   res.json(out);
+});
+
+// --- Public policy pages ---
+//
+// Atlassian requires a privacy policy URL before an OAuth app can be shared beyond its
+// owner. Served from here because this backend is already deployed on a domain you
+// control — no extra hosting, and the URL never goes stale.
+//
+// The contents describe what this app ACTUALLY does. Set VENDOR_NAME and
+// PRIVACY_CONTACT_EMAIL; review the wording before pointing Atlassian at it.
+const VENDOR_NAME = process.env.VENDOR_NAME || 'the WorkLog AI operator';
+const PRIVACY_CONTACT = process.env.PRIVACY_CONTACT_EMAIL || 'SET_PRIVACY_CONTACT_EMAIL';
+
+function policyPage(title, bodyHtml) {
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${title} — WorkLog AI</title>
+<style>
+  :root{color-scheme:light dark;--bg:#fff;--fg:#16181d;--muted:#5b6472;--line:#e5e7eb}
+  @media (prefers-color-scheme:dark){:root{--bg:#14161b;--fg:#e6e8ee;--muted:#98a2b3;--line:#2a2e38}}
+  body{margin:0;background:var(--bg);color:var(--fg);
+       font:16px/1.65 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,system-ui,sans-serif}
+  main{max-width:720px;margin:0 auto;padding:48px 22px 80px}
+  h1{font-size:26px;margin:0 0 6px}
+  h2{font-size:17px;margin:32px 0 8px}
+  .updated{color:var(--muted);font-size:13px;margin-bottom:28px}
+  ul{padding-left:20px}li{margin:5px 0}
+  code{background:rgba(127,127,127,.14);padding:1px 5px;border-radius:4px;font-size:14px}
+  hr{border:none;border-top:1px solid var(--line);margin:34px 0}
+  a{color:inherit}
+</style></head><body><main>${bodyHtml}</main></body></html>`;
+}
+
+app.get('/privacy', (_req, res) => {
+  res.type('html').send(policyPage('Privacy Policy', `
+  <h1>WorkLog AI — Privacy Policy</h1>
+  <div class="updated">Operated by ${VENDOR_NAME}. Last updated ${new Date().toISOString().slice(0, 10)}.</div>
+
+  <p>WorkLog AI is an internal tool that turns a person's daily Slack stand-up update into
+  a guided form, and optionally shows their Jira issues alongside it. It is used by
+  members of the operator's organisation. This page describes exactly what it stores.</p>
+
+  <h2>What is stored</h2>
+  <ul>
+    <li><b>Slack access token</b> issued to you when you sign in, plus your Slack user id and display name.</li>
+    <li><b>Jira access and refresh tokens</b> if you choose to connect Jira, plus your Atlassian account id, display name, and which Jira site you connected.</li>
+    <li><b>Your daily log</b>: the items in your start-work and finish-work posts, their status, an optional 1–5 mood rating, and optional achievements text.</li>
+    <li><b>References to your Slack messages</b>: channel id, thread and message timestamps — not a copy of your conversations.</li>
+  </ul>
+
+  <h2>What it does with them</h2>
+  <ul>
+    <li>Reads your own Slack messages to find your stand-up thread, and posts your update <b>as you</b>.</li>
+    <li>Reads your assigned Jira issues. The Jira permissions requested are <b>read-only</b>
+        (<code>read:jira-work</code>, <code>read:jira-user</code>) — it cannot modify anything in Jira.</li>
+    <li>Stores your daily log so it can carry unfinished items into the next day.</li>
+  </ul>
+
+  <h2>Where it is stored, and who sees it</h2>
+  <p>In a Postgres database operated by ${VENDOR_NAME}. Data is not sold, and is not shared
+  with third parties. The only external services contacted are Slack and Atlassian, on
+  your behalf, using your own tokens.</p>
+
+  <h2>Retention and removal</h2>
+  <ul>
+    <li><b>Disconnecting Jira</b> in the extension's settings deletes your Jira tokens immediately.</li>
+    <li><b>Signing out</b> removes the session from your browser. Your stored Slack token and
+        daily log remain on the server until deleted — email the contact below to have
+        your data removed.</li>
+    <li>You can also revoke access at any time from Slack and from your Atlassian account settings.</li>
+  </ul>
+
+  <h2>Contact</h2>
+  <p>${PRIVACY_CONTACT}</p>
+  <hr>
+  <p class="updated">See also the <a href="/terms">terms of use</a>.</p>`));
+});
+
+app.get('/terms', (_req, res) => {
+  res.type('html').send(policyPage('Terms of Use', `
+  <h1>WorkLog AI — Terms of Use</h1>
+  <div class="updated">Operated by ${VENDOR_NAME}. Last updated ${new Date().toISOString().slice(0, 10)}.</div>
+
+  <p>WorkLog AI is an internal tool provided by ${VENDOR_NAME} to members of its
+  organisation, at no charge and without warranty.</p>
+
+  <h2>Use</h2>
+  <ul>
+    <li>Sign in with your own Slack and Atlassian accounts. Posts are made as you, so you
+        are responsible for what you publish through it.</li>
+    <li>Access to the tool follows access to the underlying Slack workspace and Jira site.</li>
+  </ul>
+
+  <h2>Availability</h2>
+  <p>The service may change or stop at any time. It depends on Slack and Atlassian, and
+  will not work when those are unavailable.</p>
+
+  <h2>Liability</h2>
+  <p>Provided "as is". ${VENDOR_NAME} is not liable for lost or incorrect updates, or for
+  anything arising from use of the tool, to the extent permitted by law.</p>
+
+  <h2>Contact</h2>
+  <p>${PRIVACY_CONTACT}</p>
+  <hr>
+  <p class="updated">See also the <a href="/privacy">privacy policy</a>.</p>`));
 });
 
 // --- Auth (tab-based OAuth) ---
