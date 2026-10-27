@@ -365,7 +365,7 @@ export async function monthWeight(conn, { storyPointsField, onTokens, now = new 
   if (!spIds.length) return { found: true, field: found.month[0].name, noStoryPoints: true };
 
   const cfRef = (f) => (f.id.startsWith('customfield_') ? `cf[${f.id.slice(12)}]` : `"${f.name}"`);
-  const fields = ['summary', ...spIds, ...found.month.map((f) => f.id)];
+  const fields = ['summary', 'issuetype', 'timespent', 'timeoriginalestimate', ...spIds, ...found.month.map((f) => f.id)];
   const local = new Date(now.getTime() + tzOffsetMin * 60000);
   const year = local.getUTCFullYear();
   const month0 = local.getUTCMonth();
@@ -398,9 +398,13 @@ export async function monthWeight(conn, { storyPointsField, onTokens, now = new 
     return null;
   };
 
-  let points = 0, withPoints = 0;
+  let points = 0, withPoints = 0, bugCount = 0, timeSpentSeconds = 0, estimateSeconds = 0;
   const usedSp = new Set();
   for (const i of byKey.values()) {
+    // Bug sub-task types ("Bug", "Sub-bug", "Bug Sub-task") all count as bugs.
+    if (/bug/i.test(i.fields?.issuetype?.name || '')) bugCount += 1;
+    timeSpentSeconds += Number(i.fields?.timespent) || 0;
+    estimateSeconds += Number(i.fields?.timeoriginalestimate) || 0;
     const sp = pointsOf(i);
     if (sp == null) continue;
     points += sp; withPoints += 1;
@@ -418,6 +422,9 @@ export async function monthWeight(conn, { storyPointsField, onTokens, now = new 
     points: Math.round(points * 100) / 100,
     issueCount: byKey.size,
     withPoints,
+    bugCount,
+    timeSpentSeconds,
+    estimateSeconds,
     storyPointsFieldUsed: best,
     // For diagnosing a zero: which fields were considered.
     fieldsChecked: { month: found.month, points: spIds },
