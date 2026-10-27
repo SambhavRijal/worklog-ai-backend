@@ -465,6 +465,9 @@ app.get('/jira/month', async (req, res) => {
     const out = await monthWeight(conn, {
       storyPointsField: spField, onTokens, tzOffsetMin: Number.isFinite(tz) ? tz : 0,
     });
+    if (out.storyPointsFieldUsed && out.storyPointsFieldUsed !== spField) {
+      try { await setJiraStoryPointsField(user.id, out.storyPointsFieldUsed); } catch { /* non-fatal */ }
+    }
     res.json({ connected: true, ...out });
   } catch (e) {
     if (e.message === 'JIRA_UNAUTHORISED') {

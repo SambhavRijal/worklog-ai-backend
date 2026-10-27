@@ -299,10 +299,17 @@ export async function issuesForMode(conn, { mode = 'checkout', storyPointsField,
 // similar), not by sprint or by when the status changed. So: every issue assigned to
 // me whose counted-as value falls in the current month, story points summed.
 // Discovered by name because the custom field id differs per site.
-export async function findWeightMonthField(conn, opts) {
+// Sites often carry several same-named fields (company- and team-managed copies), and
+// only one of them is actually filled in — so collect every match, not the first.
+export async function findMonthWeightFields(conn, opts) {
   const fields = await callJira(conn, '/rest/api/3/field', opts);
-  const match = (fields || []).find((f) => /task\s*weight\s*counted/i.test((f.name || '').trim()));
-  return match ? { id: match.id, name: match.name, type: match.schema?.type || null } : null;
+  const pick = (re) => (fields || [])
+    .filter((f) => re.test((f.name || '').trim()))
+    .map((f) => ({ id: f.id, name: f.name, type: f.schema?.type || null }));
+  return {
+    month: pick(/task\s*weight\s*counted/i),
+    points: pick(/^story\s*points?(\s*estimate)?$/i),
+  };
 }
 
 // Page through a search. /search/jql pages by nextPageToken, the old /search by startAt.
@@ -350,41 +357,69 @@ function valueInMonth(raw, year, month0) {
 
 export async function monthWeight(conn, { storyPointsField, onTokens, now = new Date(), tzOffsetMin = 0 } = {}) {
   const opts = { onTokens };
-  const field = await findWeightMonthField(conn, opts);
-  if (!field) return { found: false };
-  if (!storyPointsField) return { found: true, field: field.name, noStoryPoints: true };
+  const found = await findMonthWeightFields(conn, opts);
+  if (!found.month.length) return { found: false };
 
-  const cf = field.id.startsWith('customfield_') ? `cf[${field.id.slice(12)}]` : `"${field.name}"`;
-  const fields = ['summary', storyPointsField, field.id];
-  // Month boundaries in the caller's timezone, so "this month" matches their calendar.
+  // The stored story-points field first, then any other same-named field.
+  const spIds = [...new Set([storyPointsField, ...found.points.map((f) => f.id)].filter(Boolean))];
+  if (!spIds.length) return { found: true, field: found.month[0].name, noStoryPoints: true };
+
+  const cfRef = (f) => (f.id.startsWith('customfield_') ? `cf[${f.id.slice(12)}]` : `"${f.name}"`);
+  const fields = ['summary', ...spIds, ...found.month.map((f) => f.id)];
   const local = new Date(now.getTime() + tzOffsetMin * 60000);
   const year = local.getUTCFullYear();
   const month0 = local.getUTCMonth();
 
-  let issues;
-  if (field.type === 'date' || field.type === 'datetime') {
-    // startOfMonth() resolves in the Jira user's own timezone.
-    const jql = `assignee = currentUser() AND ${cf} >= startOfMonth() AND ${cf} <= endOfMonth()`;
-    issues = await searchAll(conn, { jql, fields, opts });
-  } else {
-    // Select/text field: JQL can't range over it, so fetch mine with a value set and
-    // match the month here.
-    const jql = `assignee = currentUser() AND ${cf} IS NOT EMPTY AND updated >= startOfMonth(-3)`;
-    const all = await searchAll(conn, { jql, fields, opts });
-    issues = all.filter((i) => valueInMonth(i.fields?.[field.id], year, month0));
+  const dateFields = found.month.filter((f) => f.type === 'date' || f.type === 'datetime');
+  const otherFields = found.month.filter((f) => !dateFields.includes(f));
+  const byKey = new Map();
+
+  if (dateFields.length) {
+    // startOfMonth()/endOfMonth() resolve in the Jira user's own timezone.
+    const range = dateFields.map((f) => `(${cfRef(f)} >= startOfMonth() AND ${cfRef(f)} <= endOfMonth())`).join(' OR ');
+    const jql = `assignee = currentUser() AND (${range})`;
+    for (const i of await searchAll(conn, { jql, fields, opts })) byKey.set(i.key, i);
+  }
+  if (otherFields.length) {
+    // Select/text: JQL can't range over it, so fetch mine with a value and match here.
+    const any = otherFields.map((f) => `${cfRef(f)} IS NOT EMPTY`).join(' OR ');
+    const jql = `assignee = currentUser() AND (${any}) AND updated >= startOfMonth(-3)`;
+    for (const i of await searchAll(conn, { jql, fields, opts })) {
+      if (otherFields.some((f) => valueInMonth(i.fields?.[f.id], year, month0))) byKey.set(i.key, i);
+    }
   }
 
+  // Per issue, the first story-points field that holds a number.
+  const pointsOf = (i) => {
+    for (const id of spIds) {
+      const v = i.fields?.[id];
+      if (v != null && v !== '' && Number.isFinite(Number(v))) return Number(v);
+    }
+    return null;
+  };
+
   let points = 0, withPoints = 0;
-  for (const i of issues) {
-    const sp = Number(i.fields?.[storyPointsField]);
-    if (Number.isFinite(sp)) { points += sp; withPoints += 1; }
+  const usedSp = new Set();
+  for (const i of byKey.values()) {
+    const sp = pointsOf(i);
+    if (sp == null) continue;
+    points += sp; withPoints += 1;
+    usedSp.add(spIds.find((id) => i.fields?.[id] != null));
   }
+
+  // Remember the story-points field that actually carries values, so the sprint
+  // panel's chips use the right one too.
+  const best = [...usedSp][0] || null;
+
   return {
     found: true,
-    field: field.name,
+    field: found.month[0].name,
     month: `${year}-${String(month0 + 1).padStart(2, '0')}`,
     points: Math.round(points * 100) / 100,
-    issueCount: issues.length,
+    issueCount: byKey.size,
     withPoints,
+    storyPointsFieldUsed: best,
+    // For diagnosing a zero: which fields were considered.
+    fieldsChecked: { month: found.month, points: spIds },
   };
 }
