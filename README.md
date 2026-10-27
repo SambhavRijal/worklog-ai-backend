@@ -61,6 +61,7 @@ Copy `.env.example` to `.env` and fill it in. The ones that matter:
 | `GET /jira/status` | Is Jira linked for me? |
 | `POST /jira/disconnect` | Unlink Jira |
 | `GET /jira/today` | My sprint sub-tasks (`?mode=checkin` or `checkout`) |
+| `GET /jira/month` | Story points this month — issues whose "Task Weight Counted As" falls in the current month (`?tz=` minutes east of UTC) |
 | `GET /day/checkin` | Items still open on the last day worked, + today's thread |
 | `POST /day/start` | Posts the start-work message into that thread |
 | `GET /day/today` | Today's start-work post + parsed items |

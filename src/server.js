@@ -45,7 +45,7 @@ import {
 } from './parse.js';
 import {
   jiraConfigured, jiraAuthUrl, exchangeJiraCode, accessibleResources,
-  jiraMyself, findStoryPointsField, findSubtaskIssueTypes, listIssueTypes, issuesForMode,
+  jiraMyself, findStoryPointsField, findSubtaskIssueTypes, monthWeight, listIssueTypes, issuesForMode,
   buildJql, statusesFor, countFor, sampleMine, runJql,
 } from './jira.js';
 
@@ -432,6 +432,40 @@ app.get('/jira/today', async (req, res) => {
     const mode = req.query.mode === 'checkin' ? 'checkin' : 'checkout';
     const issues = await issuesForMode(conn, { mode, storyPointsField: spField, issueTypes, onTokens });
     res.json({ connected: true, siteName: conn.site_name, mode, issueTypes, issues });
+  } catch (e) {
+    if (e.message === 'JIRA_UNAUTHORISED') {
+      return res.status(409).json({ error: 'Jira access expired — reconnect Jira in Settings.' });
+    }
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// This month's task weight: story points on my issues whose "Task Weight Counted As"
+// falls in the current month. Independent of sprint and of the page the modal is on.
+// ?tz=<minutes east of UTC> picks which calendar month "this month" is.
+app.get('/jira/month', async (req, res) => {
+  const auth = await requireAuth(req, res);
+  if (!auth) return;
+  try {
+    const me = await whoAmI(auth.client);
+    const user = auth.user || await upsertUser(me.userId, me.user);
+    const conn = await getJiraConnection(user.id);
+    if (!conn) return res.json({ connected: false });
+
+    const onTokens = (t) => updateJiraTokens(user.id, t);
+    let spField = conn.story_points_field;
+    if (!spField) {
+      try {
+        spField = await findStoryPointsField(conn, { onTokens });
+        if (spField) await setJiraStoryPointsField(user.id, spField);
+      } catch { /* non-fatal */ }
+    }
+    const tz = Number(req.query.tz);
+    const out = await monthWeight(conn, {
+      storyPointsField: spField, onTokens, tzOffsetMin: Number.isFinite(tz) ? tz : 0,
+    });
+    res.json({ connected: true, ...out });
   } catch (e) {
     if (e.message === 'JIRA_UNAUTHORISED') {
       return res.status(409).json({ error: 'Jira access expired — reconnect Jira in Settings.' });

@@ -292,3 +292,99 @@ export async function issuesForMode(conn, { mode = 'checkout', storyPointsField,
     };
   });
 }
+
+// ---- This month's task weight ----
+//
+// Story points count toward the month in a custom field ("Task Weight Counted As" or
+// similar), not by sprint or by when the status changed. So: every issue assigned to
+// me whose counted-as value falls in the current month, story points summed.
+// Discovered by name because the custom field id differs per site.
+export async function findWeightMonthField(conn, opts) {
+  const fields = await callJira(conn, '/rest/api/3/field', opts);
+  const match = (fields || []).find((f) => /task\s*weight\s*counted/i.test((f.name || '').trim()));
+  return match ? { id: match.id, name: match.name, type: match.schema?.type || null } : null;
+}
+
+// Page through a search. /search/jql pages by nextPageToken, the old /search by startAt.
+async function searchAll(conn, { jql, fields, opts, cap = 1000 }) {
+  const out = [];
+  try {
+    let nextPageToken;
+    do {
+      const body = { jql, fields, maxResults: 100, ...(nextPageToken ? { nextPageToken } : {}) };
+      const r = await callJira(conn, '/rest/api/3/search/jql', { method: 'POST', body, ...opts });
+      out.push(...(r?.issues || []));
+      nextPageToken = r?.isLast ? null : r?.nextPageToken;
+    } while (nextPageToken && out.length < cap);
+    return out;
+  } catch (e) {
+    if (e.message === 'JIRA_UNAUTHORISED') throw e;
+    out.length = 0;
+    let startAt = 0;
+    for (;;) {
+      const body = { jql, fields, maxResults: 100, startAt };
+      const r = await callJira(conn, '/rest/api/3/search', { method: 'POST', body, ...opts });
+      const page = r?.issues || [];
+      out.push(...page);
+      startAt += page.length;
+      if (!page.length || startAt >= (r?.total ?? 0) || out.length >= cap) return out;
+    }
+  }
+}
+
+const MONTHS = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
+
+// Does a non-date field value (a select option like "October 2026", or text) name
+// the given month? Accepts "2026-10", "Oct 2026", "October", etc.
+function valueInMonth(raw, year, month0) {
+  const v = Array.isArray(raw) ? raw[0] : raw;
+  const s = String(v?.value ?? v?.name ?? v ?? '').trim().toLowerCase();
+  if (!s) return false;
+  const iso = s.match(/(\d{4})[-/.](\d{1,2})/);
+  if (iso) return +iso[1] === year && +iso[2] - 1 === month0;
+  const named = MONTHS.findIndex((m) => s.includes(m));
+  if (named === -1) return false;
+  const y = s.match(/\b(\d{4})\b/);
+  return named === month0 && (!y || +y[1] === year);
+}
+
+export async function monthWeight(conn, { storyPointsField, onTokens, now = new Date(), tzOffsetMin = 0 } = {}) {
+  const opts = { onTokens };
+  const field = await findWeightMonthField(conn, opts);
+  if (!field) return { found: false };
+  if (!storyPointsField) return { found: true, field: field.name, noStoryPoints: true };
+
+  const cf = field.id.startsWith('customfield_') ? `cf[${field.id.slice(12)}]` : `"${field.name}"`;
+  const fields = ['summary', storyPointsField, field.id];
+  // Month boundaries in the caller's timezone, so "this month" matches their calendar.
+  const local = new Date(now.getTime() + tzOffsetMin * 60000);
+  const year = local.getUTCFullYear();
+  const month0 = local.getUTCMonth();
+
+  let issues;
+  if (field.type === 'date' || field.type === 'datetime') {
+    // startOfMonth() resolves in the Jira user's own timezone.
+    const jql = `assignee = currentUser() AND ${cf} >= startOfMonth() AND ${cf} <= endOfMonth()`;
+    issues = await searchAll(conn, { jql, fields, opts });
+  } else {
+    // Select/text field: JQL can't range over it, so fetch mine with a value set and
+    // match the month here.
+    const jql = `assignee = currentUser() AND ${cf} IS NOT EMPTY AND updated >= startOfMonth(-3)`;
+    const all = await searchAll(conn, { jql, fields, opts });
+    issues = all.filter((i) => valueInMonth(i.fields?.[field.id], year, month0));
+  }
+
+  let points = 0, withPoints = 0;
+  for (const i of issues) {
+    const sp = Number(i.fields?.[storyPointsField]);
+    if (Number.isFinite(sp)) { points += sp; withPoints += 1; }
+  }
+  return {
+    found: true,
+    field: field.name,
+    month: `${year}-${String(month0 + 1).padStart(2, '0')}`,
+    points: Math.round(points * 100) / 100,
+    issueCount: issues.length,
+    withPoints,
+  };
+}
