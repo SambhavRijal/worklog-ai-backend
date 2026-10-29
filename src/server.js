@@ -33,7 +33,7 @@ import {
   pool, upsertUser, saveUserToken, createSession, getUserBySession,
   saveDailyLog, saveStartLog, getDayLog, savePendingAuth, takePendingAuth,
   saveJiraConnection, getJiraConnection, deleteJiraConnection, updateJiraTokens,
-  setJiraStoryPointsField, setJiraIssueTypes, createJiraAuthState, getJiraAuthState,
+  setJiraStoryPointsField, setJiraIssueTypes, getTaskWeight, setTaskWeight, createJiraAuthState, getJiraAuthState,
   finishJiraAuthState, takeJiraAuthResult, deleteUserData,
 } from './db.js';
 import {
@@ -468,11 +468,57 @@ app.get('/jira/month', async (req, res) => {
     if (out.storyPointsFieldUsed && out.storyPointsFieldUsed !== spField) {
       try { await setJiraStoryPointsField(user.id, out.storyPointsFieldUsed); } catch { /* non-fatal */ }
     }
-    res.json({ connected: true, ...out });
+    // The active position's weight is the 100% mark for the percentage.
+    let target = null;
+    try {
+      const tw = await getTaskWeight(user.id);
+      const p = tw.positions.find((x) => x.id === tw.activeId);
+      if (p) target = { id: p.id, name: p.name, weight: p.weight };
+    } catch { /* non-fatal: strip just shows no percentage */ }
+    res.json({ connected: true, ...out, target });
   } catch (e) {
     if (e.message === 'JIRA_UNAUTHORISED') {
       return res.status(409).json({ error: 'Jira access expired — reconnect Jira in Settings.' });
     }
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ---- Task weight positions ----
+// A position ("J1 Frontend") carries the month's 100% story-point target; the active
+// one is what the month strip's percentage is measured against.
+function cleanTaskWeight(body) {
+  const positions = (Array.isArray(body?.positions) ? body.positions : [])
+    .slice(0, 50)
+    .map((p) => ({
+      id: String(p?.id ?? '').slice(0, 40) || randomUUID(),
+      name: String(p?.name ?? '').trim().slice(0, 60),
+      weight: Number(p?.weight),
+    }))
+    .filter((p) => p.name && Number.isFinite(p.weight) && p.weight > 0);
+  const ids = new Set(positions.map((p) => p.id));
+  const activeId = ids.has(String(body?.activeId)) ? String(body.activeId) : (positions[0]?.id ?? null);
+  return { positions, activeId };
+}
+
+app.get('/me/task-weight', async (req, res) => {
+  const auth = await requireAuth(req, res);
+  if (!auth) return;
+  try {
+    res.json(await getTaskWeight(auth.user.id));
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/me/task-weight', async (req, res) => {
+  const auth = await requireAuth(req, res);
+  if (!auth) return;
+  try {
+    res.json(await setTaskWeight(auth.user.id, cleanTaskWeight(req.body)));
+  } catch (e) {
     console.error(e);
     res.status(500).json({ error: e.message });
   }

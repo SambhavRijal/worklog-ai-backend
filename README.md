@@ -62,6 +62,8 @@ Copy `.env.example` to `.env` and fill it in. The ones that matter:
 | `POST /jira/disconnect` | Unlink Jira |
 | `GET /jira/today` | My sprint sub-tasks (`?mode=checkin` or `checkout`) |
 | `GET /jira/month` | Story points this month — issues whose "Task Weight Counted As" falls in the current month (`?tz=` minutes east of UTC) |
+| `GET /me/task-weight` | My positions (`{ positions: [{ id, name, weight }], activeId }`) — weight is the month's 100% story-point target |
+| `POST /me/task-weight` | Save positions + which one is current; `/jira/month` returns the current one as `target` |
 | `GET /day/checkin` | Items still open on the last day worked, + today's thread |
 | `POST /day/start` | Posts the start-work message into that thread |
 | `GET /day/today` | Today's start-work post + parsed items |

@@ -156,6 +156,9 @@ export const SCHEMA_SQL = `
     -- Added after the table shipped, so it needs an explicit ALTER: CREATE TABLE
     -- IF NOT EXISTS won't add columns to a table that already exists.
     ALTER TABLE jira_connections ADD COLUMN IF NOT EXISTS issue_types TEXT;
+    -- Task-weight positions ({ positions: [{ id, name, weight }], activeId }): each
+    -- position's weight is the month's 100% story-point target.
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS task_weight JSONB;
 `;
 
 export async function initSchema() {
@@ -240,6 +243,31 @@ export async function deleteUserData(userId) {
   }
   await query('DELETE FROM users WHERE id = $1', [userId]);
   return counts;
+}
+
+// --- Task weight positions ---
+//
+// Schema changes here are applied by hand (init-db / SQL editor), so make sure the
+// column exists before first use rather than 500ing on a deploy that skipped it.
+let taskWeightColumn;
+function ensureTaskWeightColumn() {
+  taskWeightColumn ||= query('ALTER TABLE users ADD COLUMN IF NOT EXISTS task_weight JSONB')
+    .catch((e) => { taskWeightColumn = null; throw e; });
+  return taskWeightColumn;
+}
+
+const EMPTY_TASK_WEIGHT = { positions: [], activeId: null };
+
+export async function getTaskWeight(userId) {
+  await ensureTaskWeightColumn();
+  const row = await one('SELECT task_weight FROM users WHERE id = $1', [userId]);
+  return row?.task_weight || EMPTY_TASK_WEIGHT;
+}
+
+export async function setTaskWeight(userId, value) {
+  await ensureTaskWeightColumn();
+  await query('UPDATE users SET task_weight = $2 WHERE id = $1', [userId, JSON.stringify(value)]);
+  return value;
 }
 
 // --- Jira connection ---
