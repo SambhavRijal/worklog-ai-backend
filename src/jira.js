@@ -4,6 +4,8 @@
 // gets us a refresh token, and callJira() refreshes transparently when the stored token
 // is close to expiry — so nothing above this file has to think about it.
 
+import { computePace, localDate } from './pace.js';
+
 const AUTH_BASE = 'https://auth.atlassian.com';
 const API_BASE = 'https://api.atlassian.com';
 
@@ -171,6 +173,14 @@ function statusList(envValue, fallback) {
 // Status names contain spaces, so they must be quoted in JQL.
 const jqlString = (v) => `"${String(v).replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
 
+// When did this ticket reach Done? statuscategorychangedate is when it last changed
+// status CATEGORY, so it's the Done moment for anything currently Done; resolutiondate
+// covers workflows that set a resolution instead.
+function doneDateOf(f, offsetMin) {
+  if (f?.status?.statusCategory?.key !== 'done') return null;
+  return localDate(f.statuscategorychangedate || f.resolutiondate, offsetMin);
+}
+
 export function statusesFor(mode) {
   return mode === 'checkin'
     ? statusList(process.env.JIRA_CHECKIN_STATUSES, DEFAULT_CHECKIN_STATUSES)
@@ -266,7 +276,7 @@ export async function runJql(conn, jql, opts, { limit = 10 } = {}) {
 // Sprint-scoped sub-tasks assigned to me, filtered by mode. Normalised for the extension.
 export async function issuesForMode(conn, { mode = 'checkout', storyPointsField, issueTypes, onTokens, clock = null } = {}) {
   const opts = { onTokens };
-  const fields = ['summary', 'status', 'issuetype', 'priority', 'timespent', 'parent'];
+  const fields = ['summary', 'status', 'issuetype', 'priority', 'timespent', 'parent', 'statuscategorychangedate', 'resolutiondate'];
   if (storyPointsField) fields.push(storyPointsField);
 
   let data;
@@ -295,6 +305,8 @@ export async function issuesForMode(conn, { mode = 'checkout', storyPointsField,
       parentSummary: f.parent?.fields?.summary || null,
       storyPoints: storyPointsField ? (f[storyPointsField] ?? null) : null,
       timeSpentSeconds: f.timespent ?? null,
+      // Moved to Done today (user's day) — these are the points earned today.
+      doneToday: !!clock && doneDateOf(f, clock.offsetMin) === clock.today,
       url: site ? `${site}/browse/${i.key}` : null,
     };
   });
@@ -362,7 +374,7 @@ function valueInMonth(raw, year, month0) {
   return named === month0 && (!y || +y[1] === year);
 }
 
-export async function monthWeight(conn, { storyPointsField, onTokens, clock } = {}) {
+export async function monthWeight(conn, { storyPointsField, onTokens, clock, target = null } = {}) {
   const opts = { onTokens };
   const found = await findMonthWeightFields(conn, opts);
   if (!found.month.length) return { found: false };
@@ -372,7 +384,10 @@ export async function monthWeight(conn, { storyPointsField, onTokens, clock } = 
   if (!spIds.length) return { found: true, field: found.month[0].name, noStoryPoints: true };
 
   const cfRef = (f) => (f.id.startsWith('customfield_') ? `cf[${f.id.slice(12)}]` : `"${f.name}"`);
-  const fields = ['summary', 'issuetype', 'timespent', 'timeoriginalestimate', ...spIds, ...found.month.map((f) => f.id)];
+  const fields = [
+    'summary', 'issuetype', 'status', 'timespent', 'timeoriginalestimate',
+    'statuscategorychangedate', 'resolutiondate', ...spIds, ...found.month.map((f) => f.id),
+  ];
   // The user's month, from their clock — not the server's or Jira's.
   const year = clock.year;
   const month0 = clock.month0;
@@ -425,6 +440,21 @@ export async function monthWeight(conn, { storyPointsField, onTokens, clock } = 
   // panel's chips use the right one too.
   const best = [...usedSp][0] || null;
 
+  const site = (conn.site_url || '').replace(/\/$/, '');
+  const pace = computePace({
+    issues: [...byKey.values()].map((i) => ({
+      key: i.key,
+      summary: i.fields?.summary || '',
+      points: pointsOf(i),
+      doneDate: doneDateOf(i.fields, clock.offsetMin),
+      timeSpentSeconds: Number(i.fields?.timespent) || 0,
+      url: site ? `${site}/browse/${i.key}` : null,
+    })),
+    clock,
+    totalPoints: Math.round(points * 100) / 100,
+    target,
+  });
+
   return {
     found: true,
     field: found.month[0].name,
@@ -436,6 +466,7 @@ export async function monthWeight(conn, { storyPointsField, onTokens, clock } = 
     timeSpentSeconds,
     estimateSeconds,
     storyPointsFieldUsed: best,
+    pace,
     // For diagnosing a zero: which fields were considered.
     fieldsChecked: { month: found.month, points: spIds },
   };

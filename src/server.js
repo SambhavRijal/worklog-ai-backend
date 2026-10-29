@@ -33,7 +33,7 @@ import {
   pool, upsertUser, saveUserToken, createSession, getUserBySession,
   saveDailyLog, saveStartLog, getDayLog, savePendingAuth, takePendingAuth,
   saveJiraConnection, getJiraConnection, deleteJiraConnection, updateJiraTokens,
-  setJiraStoryPointsField, setJiraIssueTypes, getTaskWeight, setTaskWeight, createJiraAuthState, getJiraAuthState,
+  setJiraStoryPointsField, setJiraIssueTypes, getTaskWeight, setTaskWeight, getPrefs, setPrefs, saveDailyStats, createJiraAuthState, getJiraAuthState,
   finishJiraAuthState, takeJiraAuthResult, deleteUserData,
 } from './db.js';
 import {
@@ -444,6 +444,53 @@ app.get('/jira/today', async (req, res) => {
   }
 });
 
+// Both ticket lists for the modal in one round trip:
+//   today — sprint sub-tasks that moved today (doneToday marks points earned today)
+//   next  — sprint sub-tasks still To Do / In Progress, minus any already in `today`
+// Same scoping and field discovery as /jira/today; that endpoint stays for older
+// extension builds.
+app.get('/jira/board', async (req, res) => {
+  const auth = await requireAuth(req, res);
+  if (!auth) return;
+  try {
+    const me = await whoAmI(auth.client);
+    const user = auth.user || await upsertUser(me.userId, me.user);
+    const conn = await getJiraConnection(user.id);
+    if (!conn) return res.json({ connected: false, today: [], next: [] });
+
+    const onTokens = (t) => updateJiraTokens(user.id, t);
+    let spField = conn.story_points_field;
+    if (!spField) {
+      try {
+        spField = await findStoryPointsField(conn, { onTokens });
+        if (spField) await setJiraStoryPointsField(user.id, spField);
+      } catch { /* non-fatal */ }
+    }
+    let issueTypes = (conn.issue_types || '').split(',').map((x) => x.trim()).filter(Boolean);
+    if (!issueTypes.length) {
+      try {
+        issueTypes = await findSubtaskIssueTypes(conn, { onTokens });
+        if (issueTypes.length) await setJiraIssueTypes(user.id, issueTypes);
+      } catch { /* fall back to subTaskIssueTypes() in the JQL */ }
+    }
+
+    const clock = clockFromRequest(req);
+    const common = { storyPointsField: spField, issueTypes, onTokens, clock };
+    const [today, open] = await Promise.all([
+      issuesForMode(conn, { mode: 'checkout', ...common }),
+      issuesForMode(conn, { mode: 'checkin', ...common }),
+    ]);
+    const seen = new Set(today.map((i) => i.key));
+    res.json({ connected: true, siteName: conn.site_name, today, next: open.filter((i) => !seen.has(i.key)) });
+  } catch (e) {
+    if (e.message === 'JIRA_UNAUTHORISED') {
+      return res.status(409).json({ error: 'Jira access expired — reconnect Jira in Settings.' });
+    }
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // This month's task weight: story points on my issues whose "Task Weight Counted As"
 // falls in the current month. Independent of sprint and of the page the modal is on.
 // "This month" is the user's month (X-TZ-Offset header, or ?tz= — see clock.js).
@@ -464,16 +511,18 @@ app.get('/jira/month', async (req, res) => {
         if (spField) await setJiraStoryPointsField(user.id, spField);
       } catch { /* non-fatal */ }
     }
-    const out = await monthWeight(conn, { storyPointsField: spField, onTokens, clock: clockFromRequest(req) });
-    if (out.storyPointsFieldUsed && out.storyPointsFieldUsed !== spField) {
-      try { await setJiraStoryPointsField(user.id, out.storyPointsFieldUsed); } catch { /* non-fatal */ }
-    }
-    // The active position's weight is the 100% mark for the percentage.
+    // The active position's weight is the 100% mark for the percentage and the pace.
     let target = null;
     try {
       const p = activePosition(await getTaskWeight(user.id));
       if (p) target = { id: p.id, name: p.name, weight: p.weight };
-    } catch { /* non-fatal: strip just shows no percentage */ }
+    } catch { /* non-fatal: no percentage, no required rate */ }
+    const out = await monthWeight(conn, {
+      storyPointsField: spField, onTokens, clock: clockFromRequest(req), target: target?.weight ?? null,
+    });
+    if (out.storyPointsFieldUsed && out.storyPointsFieldUsed !== spField) {
+      try { await setJiraStoryPointsField(user.id, out.storyPointsFieldUsed); } catch { /* non-fatal */ }
+    }
     res.json({ connected: true, ...out, target });
   } catch (e) {
     if (e.message === 'JIRA_UNAUTHORISED') {
@@ -522,6 +571,73 @@ function cleanTaskWeight(body) {
   const activeId = ids.has(String(body?.activeId)) ? String(body.activeId) : null;
   return { positions, activeId };
 }
+
+// ---- Per-user prefs ----
+// slackPosting: false turns the modal into a read-only Jira view (no Slack reads or
+// posts); startReminder: false silences Pip's start-work nudge.
+app.get('/me/prefs', async (req, res) => {
+  const auth = await requireAuth(req, res);
+  if (!auth) return;
+  try {
+    res.json(await getPrefs(auth.user.id));
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/me/prefs', async (req, res) => {
+  const auth = await requireAuth(req, res);
+  if (!auth) return;
+  try {
+    const patch = {};
+    for (const k of ['slackPosting', 'startReminder']) {
+      if (typeof req.body?.[k] === 'boolean') patch[k] = req.body[k];
+    }
+    res.json(await setPrefs(auth.user.id, patch));
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ---- Daily history ----
+// The extension sends the month numbers it showed when the user posted or tapped Done;
+// one row per user per day, latest wins.
+app.post('/me/snapshot', async (req, res) => {
+  const auth = await requireAuth(req, res);
+  if (!auth) return;
+  try {
+    const b = req.body || {};
+    const num = (v) => (Number.isFinite(Number(v)) && v !== null && v !== '' ? Number(v) : null);
+    const int = (v) => (num(v) == null ? null : Math.round(num(v)));
+    const p = b.pace || {};
+    await saveDailyStats(auth.user.id, todayISO(clockFromRequest(req)), {
+      month: typeof b.month === 'string' ? b.month.slice(0, 7) : null,
+      monthPoints: num(b.points),
+      earnedToday: num(p.today?.points),
+      runRate: num(p.runRate),
+      neededPerDay: num(p.neededAfterToday),
+      projected: num(p.projected),
+      target: num(b.target?.weight),
+      position: typeof b.target?.name === 'string' ? b.target.name.slice(0, 60) : null,
+      onPace: typeof p.onPace === 'boolean' ? p.onPace : null,
+      tasks: int(b.issueCount),
+      bugs: int(b.bugCount),
+      timeSpentSeconds: int(b.timeSpentSeconds),
+      estimateSeconds: int(b.estimateSeconds),
+      snapshot: {
+        points: num(b.points), issueCount: int(b.issueCount), bugCount: int(b.bugCount),
+        target: b.target ? { name: b.target.name, weight: num(b.target.weight) } : null,
+        pace: { ...p, today: p.today ? { ...p.today, tickets: undefined } : null, yesterday: undefined },
+      },
+    });
+    res.json({ ok: true });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
 
 app.get('/me/task-weight', async (req, res) => {
   const auth = await requireAuth(req, res);

@@ -49,6 +49,30 @@ async function tx(fn) {
   }
 }
 
+// One row per user per day: the month's numbers as they stood when the user posted
+// (or tapped Done). Jira can be edited later; this is what the day actually looked like.
+const DAILY_STATS_SQL = `
+    CREATE TABLE IF NOT EXISTS daily_stats (
+      user_id            INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      date               DATE NOT NULL,
+      month              TEXT,              -- yyyy-mm
+      month_points       NUMERIC,
+      earned_today       NUMERIC,
+      run_rate           NUMERIC,
+      needed_per_day     NUMERIC,           -- required rate after today
+      projected          NUMERIC,
+      target             NUMERIC,
+      position           TEXT,
+      on_pace            BOOLEAN,
+      tasks              INTEGER,
+      bugs               INTEGER,
+      time_spent_seconds INTEGER,
+      estimate_seconds   INTEGER,
+      snapshot           JSONB,             -- the full numbers, for anything not above
+      updated_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+      PRIMARY KEY (user_id, date)
+    );`;
+
 // The full schema, exported so it can be printed for pasting into a SQL console
 // (Supabase's SQL Editor, psql) — one definition, no hand-copied drift.
 export const SCHEMA_SQL = `
@@ -159,6 +183,9 @@ export const SCHEMA_SQL = `
     -- Task-weight positions ({ positions: [{ id, name, weight }], activeId }): each
     -- position's weight is the month's 100% story-point target.
     ALTER TABLE users ADD COLUMN IF NOT EXISTS task_weight JSONB;
+    -- Per-user switches ({ slackPosting, startReminder }); missing keys mean defaults.
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS prefs JSONB;
+${DAILY_STATS_SQL}
 `;
 
 export async function initSchema() {
@@ -257,6 +284,54 @@ function ensureTaskWeightColumn() {
 }
 
 const EMPTY_TASK_WEIGHT = { positions: [], activeId: null };
+
+// --- Per-user prefs ---
+export const DEFAULT_PREFS = { slackPosting: true, startReminder: true };
+
+let prefsColumn;
+function ensurePrefsColumn() {
+  prefsColumn ||= query('ALTER TABLE users ADD COLUMN IF NOT EXISTS prefs JSONB')
+    .catch((e) => { prefsColumn = null; throw e; });
+  return prefsColumn;
+}
+
+export async function getPrefs(userId) {
+  await ensurePrefsColumn();
+  const row = await one('SELECT prefs FROM users WHERE id = $1', [userId]);
+  return { ...DEFAULT_PREFS, ...(row?.prefs || {}) };
+}
+
+export async function setPrefs(userId, patch) {
+  const next = { ...(await getPrefs(userId)), ...patch };
+  await query('UPDATE users SET prefs = $2 WHERE id = $1', [userId, JSON.stringify(next)]);
+  return next;
+}
+
+// --- Daily history ---
+let statsTable;
+function ensureStatsTable() {
+  statsTable ||= query(DAILY_STATS_SQL).catch((e) => { statsTable = null; throw e; });
+  return statsTable;
+}
+
+export async function saveDailyStats(userId, date, s) {
+  await ensureStatsTable();
+  await query(
+    `INSERT INTO daily_stats
+       (user_id, date, month, month_points, earned_today, run_rate, needed_per_day, projected,
+        target, position, on_pace, tasks, bugs, time_spent_seconds, estimate_seconds, snapshot, updated_at)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16, now())
+     ON CONFLICT (user_id, date) DO UPDATE SET
+       month = EXCLUDED.month, month_points = EXCLUDED.month_points, earned_today = EXCLUDED.earned_today,
+       run_rate = EXCLUDED.run_rate, needed_per_day = EXCLUDED.needed_per_day, projected = EXCLUDED.projected,
+       target = EXCLUDED.target, position = EXCLUDED.position, on_pace = EXCLUDED.on_pace,
+       tasks = EXCLUDED.tasks, bugs = EXCLUDED.bugs, time_spent_seconds = EXCLUDED.time_spent_seconds,
+       estimate_seconds = EXCLUDED.estimate_seconds, snapshot = EXCLUDED.snapshot, updated_at = now()`,
+    [userId, date, s.month, s.monthPoints, s.earnedToday, s.runRate, s.neededPerDay, s.projected,
+     s.target, s.position, s.onPace, s.tasks, s.bugs, s.timeSpentSeconds, s.estimateSeconds,
+     JSON.stringify(s.snapshot || null)]
+  );
+}
 
 export async function getTaskWeight(userId) {
   await ensureTaskWeightColumn();
