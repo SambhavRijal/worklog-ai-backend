@@ -177,7 +177,7 @@ export function statusesFor(mode) {
     : statusList(process.env.JIRA_CHECKOUT_STATUSES, DEFAULT_CHECKOUT_STATUSES);
 }
 
-export function buildJql(mode, { includeSprint = true, issueTypes = null } = {}) {
+export function buildJql(mode, { includeSprint = true, issueTypes = null, clock = null } = {}) {
   const clauses = ['assignee = currentUser()'];
   if (includeSprint) clauses.push('sprint IN openSprints()');
   // Explicit names when we've discovered them (a superset of subTaskIssueTypes()),
@@ -186,8 +186,15 @@ export function buildJql(mode, { includeSprint = true, issueTypes = null } = {})
     ? `issuetype IN (${issueTypes.map(jqlString).join(', ')})`
     : 'issuetype IN subTaskIssueTypes()');
   clauses.push(`status IN (${statusesFor(mode).map(jqlString).join(', ')})`);
-  // startOfDay() resolves in the Jira user's own timezone, which is what you want.
-  if (mode !== 'checkin') clauses.push('status CHANGED AFTER startOfDay()');
+  // "Today" is the user's day, from the clock the extension sent. A relative offset
+  // ("-345m" = since 345 minutes ago) doesn't depend on any timezone setting, so it
+  // can't drift from the user's midnight the way startOfDay() does when the Jira
+  // profile's timezone is wrong. No clock (old extension): fall back to startOfDay().
+  if (mode !== 'checkin') {
+    clauses.push(clock
+      ? `status CHANGED AFTER -${Math.max(1, clock.minutesSinceMidnight)}m`
+      : 'status CHANGED AFTER startOfDay()');
+  }
   return `${clauses.join(' AND ')} ORDER BY updated DESC`;
 }
 
@@ -257,20 +264,20 @@ export async function runJql(conn, jql, opts, { limit = 10 } = {}) {
 }
 
 // Sprint-scoped sub-tasks assigned to me, filtered by mode. Normalised for the extension.
-export async function issuesForMode(conn, { mode = 'checkout', storyPointsField, issueTypes, onTokens } = {}) {
+export async function issuesForMode(conn, { mode = 'checkout', storyPointsField, issueTypes, onTokens, clock = null } = {}) {
   const opts = { onTokens };
   const fields = ['summary', 'status', 'issuetype', 'priority', 'timespent', 'parent'];
   if (storyPointsField) fields.push(storyPointsField);
 
   let data;
   try {
-    data = await searchIssues(conn, { jql: buildJql(mode, { issueTypes }), fields, opts });
+    data = await searchIssues(conn, { jql: buildJql(mode, { issueTypes, clock }), fields, opts });
   } catch (e) {
     if (e.message === 'JIRA_UNAUTHORISED') throw e;
     // Sites without Jira Software have no Sprint field at all, and openSprints()
     // is then a JQL error rather than an empty result. Retry unscoped so those
     // teams still get their sub-tasks.
-    data = await searchIssues(conn, { jql: buildJql(mode, { includeSprint: false, issueTypes }), fields, opts });
+    data = await searchIssues(conn, { jql: buildJql(mode, { includeSprint: false, issueTypes, clock }), fields, opts });
   }
 
   const site = (conn.site_url || '').replace(/\/$/, '');
@@ -355,7 +362,7 @@ function valueInMonth(raw, year, month0) {
   return named === month0 && (!y || +y[1] === year);
 }
 
-export async function monthWeight(conn, { storyPointsField, onTokens, now = new Date(), tzOffsetMin = 0 } = {}) {
+export async function monthWeight(conn, { storyPointsField, onTokens, clock } = {}) {
   const opts = { onTokens };
   const found = await findMonthWeightFields(conn, opts);
   if (!found.month.length) return { found: false };
@@ -366,24 +373,27 @@ export async function monthWeight(conn, { storyPointsField, onTokens, now = new 
 
   const cfRef = (f) => (f.id.startsWith('customfield_') ? `cf[${f.id.slice(12)}]` : `"${f.name}"`);
   const fields = ['summary', 'issuetype', 'timespent', 'timeoriginalestimate', ...spIds, ...found.month.map((f) => f.id)];
-  const local = new Date(now.getTime() + tzOffsetMin * 60000);
-  const year = local.getUTCFullYear();
-  const month0 = local.getUTCMonth();
+  // The user's month, from their clock — not the server's or Jira's.
+  const year = clock.year;
+  const month0 = clock.month0;
 
   const dateFields = found.month.filter((f) => f.type === 'date' || f.type === 'datetime');
   const otherFields = found.month.filter((f) => !dateFields.includes(f));
   const byKey = new Map();
 
   if (dateFields.length) {
-    // startOfMonth()/endOfMonth() resolve in the Jira user's own timezone.
-    const range = dateFields.map((f) => `(${cfRef(f)} >= startOfMonth() AND ${cfRef(f)} <= endOfMonth())`).join(' OR ');
+    // Explicit dates for the user's month rather than startOfMonth(), which follows
+    // the Jira profile's timezone. Date fields carry no time, so these are exact.
+    const range = dateFields
+      .map((f) => `(${cfRef(f)} >= "${clock.monthStart}" AND ${cfRef(f)} < "${clock.nextMonthStart}")`)
+      .join(' OR ');
     const jql = `assignee = currentUser() AND (${range})`;
     for (const i of await searchAll(conn, { jql, fields, opts })) byKey.set(i.key, i);
   }
   if (otherFields.length) {
     // Select/text: JQL can't range over it, so fetch mine with a value and match here.
     const any = otherFields.map((f) => `${cfRef(f)} IS NOT EMPTY`).join(' OR ');
-    const jql = `assignee = currentUser() AND (${any}) AND updated >= startOfMonth(-3)`;
+    const jql = `assignee = currentUser() AND (${any}) AND updated >= -100d`;
     for (const i of await searchAll(conn, { jql, fields, opts })) {
       if (otherFields.some((f) => valueInMonth(i.fields?.[f.id], year, month0))) byKey.set(i.key, i);
     }

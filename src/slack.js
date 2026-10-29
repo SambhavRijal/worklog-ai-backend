@@ -25,15 +25,17 @@ export async function exchangeCode({ code, redirectUri }) {
   return { accessToken, slackUserId };
 }
 
-// yyyy-mm-dd for today in the server's local time.
-export function todayISO() {
-  return new Date().toISOString().slice(0, 10);
+// yyyy-mm-dd for today — in the user's timezone when a clock (clock.js) is given,
+// otherwise UTC.
+export function todayISO(clock) {
+  return clock?.today ?? new Date().toISOString().slice(0, 10);
 }
 
-// Epoch seconds at local midnight today — the cutoff for "a previous day".
-function startOfTodayEpoch() {
+// Epoch seconds at the user's midnight today — the cutoff for "a previous day".
+function startOfTodayEpoch(clock) {
+  if (clock) return clock.startOfDayEpoch;
   const d = new Date();
-  d.setHours(0, 0, 0, 0);
+  d.setUTCHours(0, 0, 0, 0);
   return Math.floor(d.getTime() / 1000);
 }
 
@@ -41,7 +43,7 @@ function startOfTodayEpoch() {
 // Results come back newest-first, so skipping anything from today lands on the last
 // day actually worked — which handles weekends and holidays without special-casing:
 // on Monday this naturally finds Friday's post.
-export async function findLastPost(client, phrase, { beforeToday = true } = {}) {
+export async function findLastPost(client, phrase, { beforeToday = true, clock } = {}) {
   const res = await client.search.messages({
     query: `from:me "${phrase}"`,
     sort: 'timestamp',
@@ -49,7 +51,7 @@ export async function findLastPost(client, phrase, { beforeToday = true } = {}) 
     count: 30,
   });
 
-  const cutoff = startOfTodayEpoch();
+  const cutoff = startOfTodayEpoch(clock);
   for (const m of res?.messages?.matches || []) {
     const ts = Number(m.ts);
     if (!Number.isFinite(ts)) continue;
@@ -73,18 +75,22 @@ export async function whoAmI(client) {
 }
 
 // Find the current user's "before you start work" message from TODAY, in ANY channel.
-export async function findMorningPost(client, marker) {
-  const day = todayISO();
-  const query = `from:me on:${day} "${marker}"`;
-
+//
+// No `on:` filter: Slack resolves that against its own idea of the user's timezone,
+// which needn't match the clock we were given. Fetch recent matches and keep those
+// since the user's midnight instead.
+export async function findMorningPost(client, marker, { clock } = {}) {
+  const since = startOfTodayEpoch(clock);
   const res = await client.search.messages({
-    query,
+    query: `from:me "${marker}"`,
     sort: 'timestamp',
-    sort_dir: 'asc', // earliest first — the morning post
-    count: 20,
+    sort_dir: 'desc', // newest first, so today's are at the top
+    count: 30,
   });
 
-  const matches = res?.messages?.matches || [];
+  const matches = (res?.messages?.matches || [])
+    .filter((x) => Number(x.ts) >= since)
+    .sort((a, b) => Number(a.ts) - Number(b.ts)); // earliest first — the morning post
   if (!matches.length) return null;
 
   const m =
@@ -123,11 +129,11 @@ export async function findMorningPost(client, marker) {
 //      matching `anchorPhrase` or mentioning BOTH markers, which replies never do.
 //
 // No `on:` filter: that resolves against Slack's timezone, so instead we sort newest
-// first and cut off at local midnight ourselves.
+// first and cut off at the user's midnight ourselves.
 export async function findTodayThreadAnchor(
-  client, { startMarker, finishMarker, anchorPhrase, preferredChannelId = null }
+  client, { startMarker, finishMarker, anchorPhrase, preferredChannelId = null, clock }
 ) {
-  const since = startOfTodayEpoch();
+  const since = startOfTodayEpoch(clock);
   const queries = [];
   if (anchorPhrase) queries.push(`"${anchorPhrase}"`);
   queries.push(`"${startMarker}"`);

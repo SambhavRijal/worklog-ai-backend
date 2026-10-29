@@ -48,6 +48,7 @@ import {
   jiraMyself, findStoryPointsField, findSubtaskIssueTypes, monthWeight, listIssueTypes, issuesForMode,
   buildJql, statusesFor, countFor, sampleMine, runJql,
 } from './jira.js';
+import { clockFromRequest } from './clock.js';
 
 const app = express();
 app.use(cors());              // dev-friendly; tighten origins for production
@@ -430,7 +431,9 @@ app.get('/jira/today', async (req, res) => {
     }
 
     const mode = req.query.mode === 'checkin' ? 'checkin' : 'checkout';
-    const issues = await issuesForMode(conn, { mode, storyPointsField: spField, issueTypes, onTokens });
+    const issues = await issuesForMode(conn, {
+      mode, storyPointsField: spField, issueTypes, onTokens, clock: clockFromRequest(req),
+    });
     res.json({ connected: true, siteName: conn.site_name, mode, issueTypes, issues });
   } catch (e) {
     if (e.message === 'JIRA_UNAUTHORISED') {
@@ -443,7 +446,7 @@ app.get('/jira/today', async (req, res) => {
 
 // This month's task weight: story points on my issues whose "Task Weight Counted As"
 // falls in the current month. Independent of sprint and of the page the modal is on.
-// ?tz=<minutes east of UTC> picks which calendar month "this month" is.
+// "This month" is the user's month (X-TZ-Offset header, or ?tz= — see clock.js).
 app.get('/jira/month', async (req, res) => {
   const auth = await requireAuth(req, res);
   if (!auth) return;
@@ -461,10 +464,7 @@ app.get('/jira/month', async (req, res) => {
         if (spField) await setJiraStoryPointsField(user.id, spField);
       } catch { /* non-fatal */ }
     }
-    const tz = Number(req.query.tz);
-    const out = await monthWeight(conn, {
-      storyPointsField: spField, onTokens, tzOffsetMin: Number.isFinite(tz) ? tz : 0,
-    });
+    const out = await monthWeight(conn, { storyPointsField: spField, onTokens, clock: clockFromRequest(req) });
     if (out.storyPointsFieldUsed && out.storyPointsFieldUsed !== spField) {
       try { await setJiraStoryPointsField(user.id, out.storyPointsFieldUsed); } catch { /* non-fatal */ }
     }
@@ -708,14 +708,15 @@ app.get('/day/today', async (req, res) => {
   if (!auth) return;
   try {
     const me = await whoAmI(auth.client);
-    let post = await findMorningPost(auth.client, MARKER);
+    const clock = clockFromRequest(req);
+    let post = await findMorningPost(auth.client, MARKER, { clock });
 
     // Slack's search index lags a few minutes, so a start-work post made moments ago
     // is invisible to it. Two search-free fallbacks before giving up:
     if (!post) {
       // 1. We posted it ourselves — the record (and its items) are already local.
       const user = auth.user || await upsertUser(me.userId, me.user);
-      const local = await getDayLog(user.id, todayISO());
+      const local = await getDayLog(user.id, todayISO(clock));
       if (local?.start_post_ts && local.slack_thread_ts) {
         return res.json({
           found: true,
@@ -739,7 +740,7 @@ app.get('/day/today', async (req, res) => {
       // 2. Posted manually in Slack — read today's thread directly.
       const anchor = await findTodayThreadAnchor(auth.client, {
         startMarker: MARKER, finishMarker: FINISH_HEADER, anchorPhrase: THREAD_ANCHOR,
-        preferredChannelId: local?.slack_channel_id || null,
+        preferredChannelId: local?.slack_channel_id || null, clock,
       });
       if (anchor) {
         post = await findMyReplyInThread(auth.client, {
@@ -783,7 +784,8 @@ app.get('/day/checkin', async (req, res) => {
   const auth = await requireAuth(req, res);
   if (!auth) return;
   try {
-    const last = await findLastPost(auth.client, FINISH_HEADER);
+    const clock = clockFromRequest(req);
+    const last = await findLastPost(auth.client, FINISH_HEADER, { clock });
 
     // Today's post belongs INSIDE the daily-updates thread, so the anchor decides
     // both the channel and the thread to reply under.
@@ -792,6 +794,7 @@ app.get('/day/checkin', async (req, res) => {
       finishMarker: FINISH_HEADER,
       anchorPhrase: THREAD_ANCHOR,
       preferredChannelId: last?.channelId || null, // where these normally get posted
+      clock,
     });
 
     const carried = last ? carryOverItems(parseFinishItems(last.text)) : [];
@@ -845,7 +848,7 @@ app.post('/day/start', async (req, res) => {
 
     const logId = await saveStartLog({
       user_id: user.id,
-      date: todayISO(),
+      date: todayISO(clockFromRequest(req)),
       slack_channel_id: channelId,
       slack_thread_ts: threadTs,
       start_post_ts: posted.ts,
@@ -882,7 +885,7 @@ app.post('/day/post', async (req, res) => {
 
     const logId = await saveDailyLog({
       user_id: user.id,
-      date: todayISO(),
+      date: todayISO(clockFromRequest(req)),
       slack_channel_id: channelId,
       slack_thread_ts: threadTs,
       start_post_ts: startPostTs || null,
