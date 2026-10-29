@@ -471,8 +471,7 @@ app.get('/jira/month', async (req, res) => {
     // The active position's weight is the 100% mark for the percentage.
     let target = null;
     try {
-      const tw = await getTaskWeight(user.id);
-      const p = tw.positions.find((x) => x.id === tw.activeId);
+      const p = activePosition(await getTaskWeight(user.id));
       if (p) target = { id: p.id, name: p.name, weight: p.weight };
     } catch { /* non-fatal: strip just shows no percentage */ }
     res.json({ connected: true, ...out, target });
@@ -488,6 +487,27 @@ app.get('/jira/month', async (req, res) => {
 // ---- Task weight positions ----
 // A position ("J1 Frontend") carries the month's 100% story-point target; the active
 // one is what the month strip's percentage is measured against.
+//
+// Defaults everyone can pick from; people add their own beside them. Fixed ids, so a
+// saved activeId keeps pointing at the same default if the list is edited here later.
+const DEFAULT_POSITIONS = [
+  { id: 'default-j1-frontend', name: 'J1 Frontend', weight: 54 },
+  { id: 'default-j2-frontend', name: 'J2 Frontend', weight: 62 },
+  { id: 'default-j3-frontend', name: 'J3 Frontend', weight: 71 },
+];
+const DEFAULT_IDS = new Set(DEFAULT_POSITIONS.map((p) => p.id));
+
+// What the client sees: defaults + the user's own, and which one is current.
+function withDefaults(tw) {
+  const all = [...DEFAULT_POSITIONS, ...(tw?.positions || [])];
+  const activeId = all.some((p) => p.id === tw?.activeId) ? tw.activeId : null;
+  return { defaults: DEFAULT_POSITIONS, positions: tw?.positions || [], activeId };
+}
+
+function activePosition(tw) {
+  return [...DEFAULT_POSITIONS, ...(tw?.positions || [])].find((p) => p.id === tw?.activeId) || null;
+}
+
 function cleanTaskWeight(body) {
   const positions = (Array.isArray(body?.positions) ? body.positions : [])
     .slice(0, 50)
@@ -496,9 +516,10 @@ function cleanTaskWeight(body) {
       name: String(p?.name ?? '').trim().slice(0, 60),
       weight: Number(p?.weight),
     }))
-    .filter((p) => p.name && Number.isFinite(p.weight) && p.weight > 0);
-  const ids = new Set(positions.map((p) => p.id));
-  const activeId = ids.has(String(body?.activeId)) ? String(body.activeId) : (positions[0]?.id ?? null);
+    // Defaults aren't stored per user — only the user's own positions are.
+    .filter((p) => p.name && Number.isFinite(p.weight) && p.weight > 0 && !DEFAULT_IDS.has(p.id));
+  const ids = new Set([...DEFAULT_IDS, ...positions.map((p) => p.id)]);
+  const activeId = ids.has(String(body?.activeId)) ? String(body.activeId) : null;
   return { positions, activeId };
 }
 
@@ -506,7 +527,7 @@ app.get('/me/task-weight', async (req, res) => {
   const auth = await requireAuth(req, res);
   if (!auth) return;
   try {
-    res.json(await getTaskWeight(auth.user.id));
+    res.json(withDefaults(await getTaskWeight(auth.user.id)));
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: e.message });
@@ -517,7 +538,7 @@ app.post('/me/task-weight', async (req, res) => {
   const auth = await requireAuth(req, res);
   if (!auth) return;
   try {
-    res.json(await setTaskWeight(auth.user.id, cleanTaskWeight(req.body)));
+    res.json(withDefaults(await setTaskWeight(auth.user.id, cleanTaskWeight(req.body))));
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: e.message });
