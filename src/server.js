@@ -395,8 +395,7 @@ app.post('/jira/disconnect', async (req, res) => {
   const auth = await requireAuth(req, res);
   if (!auth) return;
   try {
-    const me = await whoAmI(auth.client);
-    const user = auth.user || await upsertUser(me.userId, me.user);
+    const user = auth.user || await (async () => { const me = await whoAmI(auth.client); return upsertUser(me.userId, me.user); })();
     const conn = await getJiraConnection(user.id);
     const watch = await getJiraWatch(user.id).catch(() => null);
     if (conn && watch?.webhook_id) await deleteMyWebhook(conn, Number(watch.webhook_id)).catch(() => {});
@@ -464,8 +463,7 @@ app.get('/jira/board', async (req, res) => {
   const auth = await requireAuth(req, res);
   if (!auth) return;
   try {
-    const me = await whoAmI(auth.client);
-    const user = auth.user || await upsertUser(me.userId, me.user);
+    const user = auth.user || await (async () => { const me = await whoAmI(auth.client); return upsertUser(me.userId, me.user); })();
     const conn = await getJiraConnection(user.id);
     if (!conn) return res.json({ connected: false, today: [], next: [] });
 
@@ -990,16 +988,20 @@ app.get('/day/today', async (req, res) => {
   const auth = await requireAuth(req, res);
   if (!auth) return;
   try {
-    const me = await whoAmI(auth.client);
     const clock = clockFromRequest(req);
-    let post = await findMorningPost(auth.client, MARKER, { clock });
+    const user = auth.user || await (async () => { const m = await whoAmI(auth.client); return upsertUser(m.userId, m.user); })();
+    const me = { userId: user.slack_user_id };
+    // The Slack search and our own record of today, at the same time.
+    const [found, local] = await Promise.all([
+      findMorningPost(auth.client, MARKER, { clock }),
+      getDayLog(user.id, todayISO(clock)).catch(() => null),
+    ]);
+    let post = found;
 
     // Slack's search index lags a few minutes, so a start-work post made moments ago
     // is invisible to it. Two search-free fallbacks before giving up:
     if (!post) {
       // 1. We posted it ourselves — the record (and its items) are already local.
-      const user = auth.user || await upsertUser(me.userId, me.user);
-      const local = await getDayLog(user.id, todayISO(clock));
       if (local?.start_post_ts && local.slack_thread_ts) {
         return res.json({
           found: true,

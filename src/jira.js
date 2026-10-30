@@ -76,19 +76,36 @@ function needsRefresh(conn) {
 }
 
 // `conn` is a jira_connections row. `onTokens` persists rotated tokens.
+const refreshing = new Map();   // spent refresh token -> the one refresh in flight
+
 export async function callJira(conn, path, { method = 'GET', body, onTokens } = {}) {
   let accessToken = conn.access_token;
 
   if (needsRefresh(conn) && conn.refresh_token) {
-    const t = await refreshJiraToken(conn.refresh_token);
+    // Several Jira calls run at once; they must share ONE refresh. Atlassian rotates
+    // refresh tokens, so a second refresh with the same (now spent) token would fail
+    // and look like "reconnect Jira".
+    let pending = refreshing.get(conn.refresh_token);
+    if (!pending) {
+      pending = (async () => {
+        const t = await refreshJiraToken(conn.refresh_token);
+        // The new refresh token must replace the old, or the next refresh fails.
+        await onTokens?.({
+          accessToken: t.access_token,
+          refreshToken: t.refresh_token,
+          expiresAt: new Date(Date.now() + (t.expires_in || 3600) * 1000).toISOString(),
+        });
+        return t;
+      })();
+      refreshing.set(conn.refresh_token, pending);
+      pending.finally(() => setTimeout(() => refreshing.delete(conn.refresh_token), 60000)).catch(() => {});
+    }
+    const t = await pending;
     accessToken = t.access_token;
-    // Atlassian rotates refresh tokens: the new one must replace the old, or the
-    // next refresh fails and the user has to reconnect by hand.
-    await onTokens?.({
-      accessToken: t.access_token,
-      refreshToken: t.refresh_token,
-      expiresAt: new Date(Date.now() + (t.expires_in || 3600) * 1000).toISOString(),
-    });
+    // Later calls on this same conn object use the fresh token without refreshing again.
+    conn.access_token = t.access_token;
+    if (t.refresh_token) conn.refresh_token = t.refresh_token;
+    conn.expires_at = new Date(Date.now() + (t.expires_in || 3600) * 1000).toISOString();
   }
 
   const url = `${API_BASE}/ex/jira/${conn.cloud_id}${path}`;
