@@ -313,7 +313,7 @@ export async function runJql(conn, jql, opts, { limit = 10 } = {}) {
 // Sprint-scoped sub-tasks assigned to me, filtered by mode. Normalised for the extension.
 export async function issuesForMode(conn, { mode = 'checkout', storyPointsField, issueTypes, onTokens, clock = null } = {}) {
   const opts = { onTokens };
-  const fields = ['summary', 'status', 'issuetype', 'priority', 'parent', 'statuscategorychangedate', 'resolutiondate', ...EXTRA_FIELDS];
+  const fields = ['summary', 'status', 'issuetype', 'priority', 'parent', 'statuscategorychangedate', 'resolutiondate', 'created', 'updated', 'duedate', ...EXTRA_FIELDS];
   if (storyPointsField) fields.push(storyPointsField);
 
   let data;
@@ -339,6 +339,9 @@ export async function issuesForMode(conn, { mode = 'checkout', storyPointsField,
       done: category === 'done',
       issueType: f.issuetype?.name || null,
       priority: f.priority ? { id: f.priority.id || null, name: f.priority.name || null, iconUrl: f.priority.iconUrl || null } : null,
+      created: f.created || null,
+      updated: f.updated || null,
+      dueDate: f.duedate || null,
       parentKey: f.parent?.key || null,
       parentSummary: f.parent?.fields?.summary || null,
       storyPoints: storyPointsField ? (f[storyPointsField] ?? null) : null,
@@ -521,6 +524,9 @@ export async function monthWeight(conn, { storyPointsField, onTokens, clock, tar
         done: cat === 'done',
         issueType: f.issuetype?.name || null,
       priority: f.priority ? { id: f.priority.id || null, name: f.priority.name || null, iconUrl: f.priority.iconUrl || null } : null,
+      created: f.created || null,
+      updated: f.updated || null,
+      dueDate: f.duedate || null,
         isBug: /bug/i.test(f.issuetype?.name || ''),
         storyPoints: pointsOf(i),
         doneDate: doneDateOf(f, clock.offsetMin),
