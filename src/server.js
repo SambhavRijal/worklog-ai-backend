@@ -15,6 +15,9 @@
 //   GET  /jira/status          -> is Jira linked for me?
 //   POST /jira/disconnect      -> unlink Jira
 //   GET  /jira/today           -> my sprint sub-tasks (?mode=checkin|checkout)
+//   GET  /jira/open            -> open sprint tickets + priority (Pip's dock)
+//   GET  /jira/changes         -> when my tickets last changed (cheap; polled)
+//   POST /jira/webhook         -> Jira calls this when a watched ticket changes
 //   GET  /jira/sites           -> which Jira sites this account granted us
 //   POST /jira/site            -> switch which granted site we query
 //   GET  /jira/probe           -> diagnose an empty panel (names + per-clause counts)
@@ -25,7 +28,7 @@
 //   POST /me/delete            -> erase everything stored for the caller
 
 import 'dotenv/config';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createHmac, timingSafeEqual } from 'node:crypto';
 import express from 'express';
 import cors from 'cors';
 
@@ -35,6 +38,7 @@ import {
   saveJiraConnection, getJiraConnection, deleteJiraConnection, updateJiraTokens,
   setJiraStoryPointsField, setJiraIssueTypes, getTaskWeight, setTaskWeight, getPrefs, setPrefs, saveDailyStats, createJiraAuthState, getJiraAuthState,
   finishJiraAuthState, takeJiraAuthResult, deleteUserData,
+  getJiraWatch, saveJiraWatch, deleteJiraWatch, markJiraChanged,
 } from './db.js';
 import {
   makeClient, exchangeCode, whoAmI, findMorningPost, findLastPost,
@@ -47,12 +51,13 @@ import {
   jiraConfigured, jiraAuthUrl, exchangeJiraCode, accessibleResources,
   jiraMyself, findStoryPointsField, findSubtaskIssueTypes, monthWeight, listIssueTypes, issuesForMode,
   buildJql, statusesFor, countFor, sampleMine, runJql,
+  registerMyWebhook, refreshMyWebhook, deleteMyWebhook, affectedAccounts,
 } from './jira.js';
 import { clockFromRequest } from './clock.js';
 
 const app = express();
 app.use(cors());              // dev-friendly; tighten origins for production
-app.use(express.json());
+app.use(express.json({ limit: '5mb' }));   // Jira webhook bodies carry whole issues
 
 const MARKER = process.env.START_MARKER || 'before you start work';
 const FINISH_HEADER = process.env.FINISH_HEADER || 'Before you finish work';
@@ -340,6 +345,8 @@ app.get('/auth/jira/callback', async (req, res) => {
     try { conn.storyPointsField = await findStoryPointsField(provisional); } catch { /* non-fatal */ }
 
     await saveJiraConnection(pending.user_id, conn);
+    // New grant (maybe with new scopes): let Pip's live updates set up afresh.
+    await deleteJiraWatch(pending.user_id).catch(() => {});
     await finishJiraAuthState(state, null);
     res.send(authResultPage({ ok: true, message: `Jira connected — ${site.name}` }));
   } catch (e) {
@@ -390,6 +397,10 @@ app.post('/jira/disconnect', async (req, res) => {
   try {
     const me = await whoAmI(auth.client);
     const user = auth.user || await upsertUser(me.userId, me.user);
+    const conn = await getJiraConnection(user.id);
+    const watch = await getJiraWatch(user.id).catch(() => null);
+    if (conn && watch?.webhook_id) await deleteMyWebhook(conn, Number(watch.webhook_id)).catch(() => {});
+    await deleteJiraWatch(user.id).catch(() => {});
     await deleteJiraConnection(user.id);
     res.json({ ok: true });
   } catch (e) {
@@ -517,10 +528,14 @@ app.get('/jira/open', async (req, res) => {
         if (issueTypes.length) await setJiraIssueTypes(user.id, issueTypes);
       } catch { /* fall back to subTaskIssueTypes() in the JQL */ }
     }
-    const issues = await issuesForMode(conn, {
-      mode: 'open', storyPointsField: spField, issueTypes, onTokens, clock: clockFromRequest(req),
+    const [issues, watch] = await Promise.all([
+      issuesForMode(conn, { mode: 'open', storyPointsField: spField, issueTypes, onTokens, clock: clockFromRequest(req) }),
+      ensureWatch(user, conn, onTokens),
+    ]);
+    res.json({
+      connected: true, siteName: conn.site_name, issues: issues.map(({ descriptionText, ...i }) => i),
+      live: watch.live, liveReason: watch.reason || null, changedAt: watch.changedAt || null,
     });
-    res.json({ connected: true, siteName: conn.site_name, issues: issues.map(({ descriptionText, ...i }) => i) });
   } catch (e) {
     if (e.message === 'JIRA_UNAUTHORISED') {
       return res.status(409).json({ error: 'Jira access expired — reconnect Jira in Settings.' });
@@ -528,6 +543,94 @@ app.get('/jira/open', async (req, res) => {
     console.error(e);
     res.status(500).json({ error: e.message });
   }
+});
+
+// ---- Live updates for Pip's dock ----
+//
+// Each person gets one Jira webhook on their own tickets (registered the first time
+// their extension asks, renewed well before its 30 days run out). When Jira calls,
+// we just note the time against whoever was affected; the extension polls
+// /jira/changes (a single row read, no Jira or Slack call) and refetches only then.
+const PUBLIC_BASE = (process.env.PUBLIC_URL || '').replace(/\/$/, '');
+const WEBHOOK_KEY = process.env.JIRA_CLIENT_SECRET
+  ? createHmac('sha256', process.env.JIRA_CLIENT_SECRET).update('worklog-jira-webhook').digest('hex').slice(0, 32)
+  : null;
+const DAY_MS = 86400000;
+
+async function ensureWatch(user, conn, onTokens) {
+  const accountId = conn.account_id;
+  if (!PUBLIC_BASE.startsWith('https://') || !WEBHOOK_KEY || !accountId) return { live: false, reason: 'unavailable' };
+  const now = Date.now();
+  const w = await getJiraWatch(user.id).catch(() => null);
+  if (w?.status === 'ok' && w.webhook_id && w.account_id === accountId && new Date(w.expires_at) - now > 10 * DAY_MS) {
+    return { live: true, changedAt: w.changed_at };
+  }
+  // A failed attempt isn't retried on every request; reconnecting Jira clears it.
+  if (w && w.status !== 'ok' && w.checked_at && now - new Date(w.checked_at) < 6 * 3600000) return { live: false, reason: w.status };
+
+  const opts = { onTokens };
+  try {
+    let id = w?.status === 'ok' && w.account_id === accountId && w.webhook_id ? Number(w.webhook_id) : null;
+    let expiresAt = null;
+    if (id) {
+      try { expiresAt = await refreshMyWebhook(conn, id, opts); } catch { id = null; }
+    }
+    if (!id) {
+      if (w?.webhook_id) await deleteMyWebhook(conn, Number(w.webhook_id), opts).catch(() => {});
+      id = await registerMyWebhook(conn, { url: `${PUBLIC_BASE}/jira/webhook?k=${WEBHOOK_KEY}`, accountId, opts });
+      expiresAt = await refreshMyWebhook(conn, id, opts).catch(() => null);
+    }
+    await saveJiraWatch(user.id, { accountId, webhookId: id, expiresAt: expiresAt || new Date(now + 30 * DAY_MS).toISOString(), status: 'ok' });
+    return { live: true, changedAt: w?.changed_at || new Date().toISOString() };
+  } catch (e) {
+    const noScope = e.message === 'JIRA_UNAUTHORISED' || /\((401|403)\)/.test(e.message);
+    console.warn('Jira webhook setup failed:', e.message);
+    await saveJiraWatch(user.id, { accountId, status: noScope ? 'no_scope' : 'error', detail: e.message.slice(0, 300) }).catch(() => {});
+    return { live: false, reason: noScope ? 'no_scope' : 'error' };
+  }
+}
+
+app.get('/jira/changes', async (req, res) => {
+  const auth = await requireAuth(req, res);
+  if (!auth) return;
+  try {
+    const w = auth.user ? await getJiraWatch(auth.user.id) : null;
+    res.json({ live: w?.status === 'ok', changedAt: w?.changed_at || null });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Jira calls this. OAuth 2.0 app webhooks carry a token signed with our client secret;
+// the URL also carries a key only Jira (and we) know. Either is enough.
+function sameText(a, b) {
+  const x = Buffer.from(String(a || '')), y = Buffer.from(String(b || ''));
+  return x.length === y.length && timingSafeEqual(x, y);
+}
+function jiraJwtOk(header) {
+  try {
+    const m = /^(?:Bearer|JWT)\s+(.+)$/i.exec(header || '');
+    if (!m || !process.env.JIRA_CLIENT_SECRET) return false;
+    const [h, p, sig] = m[1].split('.');
+    if (!sig) return false;
+    const head = JSON.parse(Buffer.from(h, 'base64url').toString());
+    if (head.alg !== 'HS256') return false;
+    const expect = createHmac('sha256', process.env.JIRA_CLIENT_SECRET).update(`${h}.${p}`).digest('base64url');
+    if (!sameText(sig, expect)) return false;
+    const claims = JSON.parse(Buffer.from(p, 'base64url').toString());
+    return !claims.exp || claims.exp * 1000 > Date.now() - 60000;
+  } catch { return false; }
+}
+app.post('/jira/webhook', async (req, res) => {
+  if (!jiraJwtOk(req.get('Authorization')) && !(WEBHOOK_KEY && sameText(req.query.k, WEBHOOK_KEY))) {
+    return res.status(401).json({ error: 'unauthorised' });
+  }
+  try {
+    await markJiraChanged(affectedAccounts(req.body));
+  } catch (e) {
+    console.error('Jira webhook:', e.message);
+  }
+  res.status(204).end();
 });
 
 // The tickets behind this month's total, for the modal's side panel. Same query as

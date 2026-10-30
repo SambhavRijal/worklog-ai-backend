@@ -73,6 +73,22 @@ const DAILY_STATS_SQL = `
       PRIMARY KEY (user_id, date)
     );`;
 
+// Live updates for Pip's dock: one Jira webhook per user (assignee = them). Jira
+// tells us when their tickets change; we only note the time, and the extension's
+// cheap poll of that time decides when to refetch the list.
+const JIRA_WATCH_SQL = `
+    CREATE TABLE IF NOT EXISTS jira_watch (
+      user_id     INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+      account_id  TEXT,
+      webhook_id  BIGINT,
+      expires_at  TIMESTAMPTZ,
+      status      TEXT,                 -- 'ok' | 'no_scope' | 'error'
+      detail      TEXT,
+      checked_at  TIMESTAMPTZ,
+      changed_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS jira_watch_account ON jira_watch (account_id);`;
+
 // The full schema, exported so it can be printed for pasting into a SQL console
 // (Supabase's SQL Editor, psql) — one definition, no hand-copied drift.
 export const SCHEMA_SQL = `
@@ -186,6 +202,7 @@ export const SCHEMA_SQL = `
     -- Per-user switches ({ slackPosting, startReminder, finishReminder, punchInModal, punchOutModal }); missing keys mean defaults.
     ALTER TABLE users ADD COLUMN IF NOT EXISTS prefs JSONB;
 ${DAILY_STATS_SQL}
+${JIRA_WATCH_SQL}
 `;
 
 export async function initSchema() {
@@ -523,4 +540,42 @@ export async function saveDailyLog(payload) {
 if (import.meta.url === `file://${process.argv[1]}`) {
   await initSchema();
   await pool.end();
+}
+
+// --- Jira live updates (webhooks) ---
+let watchTable;
+function ensureWatchTable() {
+  watchTable ||= query(JIRA_WATCH_SQL).catch((e) => { watchTable = null; throw e; });
+  return watchTable;
+}
+
+export async function getJiraWatch(userId) {
+  await ensureWatchTable();
+  return one('SELECT * FROM jira_watch WHERE user_id = $1', [userId]);
+}
+
+export async function saveJiraWatch(userId, w) {
+  await ensureWatchTable();
+  await query(
+    `INSERT INTO jira_watch (user_id, account_id, webhook_id, expires_at, status, detail, checked_at)
+     VALUES ($1, $2, $3, $4, $5, $6, now())
+     ON CONFLICT (user_id) DO UPDATE SET
+       account_id = EXCLUDED.account_id, webhook_id = EXCLUDED.webhook_id, expires_at = EXCLUDED.expires_at,
+       status = EXCLUDED.status, detail = EXCLUDED.detail, checked_at = now()`,
+    [userId, w.accountId ?? null, w.webhookId ?? null, w.expiresAt ?? null, w.status ?? null, w.detail ?? null]
+  );
+}
+
+export async function deleteJiraWatch(userId) {
+  await ensureWatchTable();
+  await query('DELETE FROM jira_watch WHERE user_id = $1', [userId]);
+}
+
+// Jira says these people's tickets changed: bump their clock.
+export async function markJiraChanged(accountIds) {
+  const ids = [...new Set(accountIds.filter(Boolean))];
+  if (!ids.length) return 0;
+  await ensureWatchTable();
+  const r = await query('UPDATE jira_watch SET changed_at = now() WHERE account_id = ANY($1)', [ids]);
+  return r.rowCount || 0;
 }

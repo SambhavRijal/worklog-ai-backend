@@ -12,7 +12,8 @@ const API_BASE = 'https://api.atlassian.com';
 // read:jira-work  — issues, JQL search, fields
 // read:jira-user  — resolve the current user
 // offline_access  — issue a refresh token (without it the link dies after an hour)
-export const JIRA_SCOPES = 'read:jira-work read:jira-user offline_access';
+// manage:jira-webhook: Pip's live ticket count (a webhook on the person's own tickets).
+export const JIRA_SCOPES = 'read:jira-work read:jira-user manage:jira-webhook offline_access';
 
 export function jiraConfigured() {
   return !!(process.env.JIRA_CLIENT_ID && process.env.JIRA_CLIENT_SECRET);
@@ -531,4 +532,43 @@ export async function monthWeight(conn, { storyPointsField, onTokens, clock, tar
     // For diagnosing a zero: which fields were considered.
     fieldsChecked: { month: found.month, points: spIds },
   };
+}
+
+// ---- Live updates: a dynamic webhook on "my tickets" ----
+//
+// OAuth 2.0 apps may register up to 5 webhooks per user; we use one. It lasts 30
+// days and is renewed whenever the person's extension asks for tickets, so anyone
+// using it never lapses. JQL here only supports a few clauses (assignee is one;
+// currentUser() isn't), so it names the person's account id.
+const WEBHOOK_EVENTS = ['jira:issue_created', 'jira:issue_updated', 'jira:issue_deleted'];
+
+export async function registerMyWebhook(conn, { url, accountId, opts }) {
+  const r = await callJira(conn, '/rest/api/3/webhook', {
+    method: 'POST',
+    body: { url, webhooks: [{ events: WEBHOOK_EVENTS, jqlFilter: `assignee = "${accountId.replace(/"/g, '')}"` }] },
+    ...opts,
+  });
+  const results = Array.isArray(r) ? r : (r?.webhookRegistrationResult || []);
+  const first = results[0] || {};
+  if (first.createdWebhookId == null) throw new Error(`Webhook not created: ${JSON.stringify(first.errors || r).slice(0, 200)}`);
+  return Number(first.createdWebhookId);
+}
+
+export async function refreshMyWebhook(conn, webhookId, opts) {
+  const r = await callJira(conn, '/rest/api/3/webhook/refresh', { method: 'PUT', body: { webhookIds: [webhookId] }, ...opts });
+  return r?.expirationDate ? new Date(r.expirationDate).toISOString() : null;
+}
+
+export async function deleteMyWebhook(conn, webhookId, opts) {
+  await callJira(conn, '/rest/api/3/webhook', { method: 'DELETE', body: { webhookIds: [webhookId] }, ...opts });
+}
+
+// Who should hear about this event? The ticket's assignee now, and whoever it was
+// taken from (so their count drops too).
+export function affectedAccounts(payload) {
+  const out = [payload?.issue?.fields?.assignee?.accountId];
+  for (const item of payload?.changelog?.items || []) {
+    if ((item.field || '').toLowerCase() === 'assignee' || item.fieldId === 'assignee') out.push(item.from, item.to);
+  }
+  return out.filter(Boolean);
 }

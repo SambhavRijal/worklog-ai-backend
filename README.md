@@ -67,6 +67,8 @@ Copy `.env.example` to `.env` and fill it in. The ones that matter:
 | `GET /jira/month/tasks` | The tickets behind this month's total (counted-at value, points, status, time vs estimate, description preview) — for the modal's side panel, fetched only when opened |
 | `GET /jira/board` | Both ticket lists in one call: `today` (sprint sub-tasks that moved today, `doneToday` = points earned today) and `next` (still To Do / In Progress) |
 | `GET /jira/open` | Everything assigned to me in the open sprint that isn't done, with `priority` — for Pip's dock on every tab |
+| `GET /jira/changes` | When Jira last told us your tickets changed (`changedAt`, `live`). One row read, no Jira call; Pip polls it every 30s |
+| `POST /jira/webhook` | Jira calls this when a ticket assigned to a user changes (webhook registered per user, renewed automatically). Verified by the signed token or the URL key |
 | `GET /me/prefs` · `POST /me/prefs` | Per-user switches: `slackPosting` (off = read-only Jira view, no Slack), `startReminder`, `finishReminder`, `punchInModal` |
 | `GET /day/finished` | Has today's "before you finish work" been posted (via WorkLog or straight in Slack)? |
 | `POST /me/snapshot` | Save the day's numbers (points, run rate, needed, on pace…) to `daily_stats`, one row per user per day |
