@@ -574,7 +574,8 @@ function cleanTaskWeight(body) {
 
 // ---- Per-user prefs ----
 // slackPosting: false turns the modal into a read-only Jira view (no Slack reads or
-// posts); startReminder / finishReminder: false silence Pip's start- and finish-work nudges.
+// posts); startReminder / finishReminder: false silence Pip's start- and finish-work nudges;
+// punchInModal / punchOutModal: false stop punching in / out from opening the modal.
 app.get('/me/prefs', async (req, res) => {
   const auth = await requireAuth(req, res);
   if (!auth) return;
@@ -591,7 +592,7 @@ app.post('/me/prefs', async (req, res) => {
   if (!auth) return;
   try {
     const patch = {};
-    for (const k of ['slackPosting', 'startReminder', 'finishReminder']) {
+    for (const k of ['slackPosting', 'startReminder', 'finishReminder', 'punchInModal', 'punchOutModal']) {
       if (typeof req.body?.[k] === 'boolean') patch[k] = req.body[k];
     }
     res.json(await setPrefs(auth.user.id, patch));
