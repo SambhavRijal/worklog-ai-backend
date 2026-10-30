@@ -228,12 +228,15 @@ export function buildJql(mode, { includeSprint = true, issueTypes = null, clock 
   clauses.push(issueTypes?.length
     ? `issuetype IN (${issueTypes.map(jqlString).join(', ')})`
     : 'issuetype IN subTaskIssueTypes()');
-  clauses.push(`status IN (${statusesFor(mode).map(jqlString).join(', ')})`);
+  // 'open': everything not finished, whatever the team's status names (Pip's dock).
+  clauses.push(mode === 'open'
+    ? 'statusCategory != Done'
+    : `status IN (${statusesFor(mode).map(jqlString).join(', ')})`);
   // "Today" is the user's day, from the clock the extension sent. A relative offset
   // ("-345m" = since 345 minutes ago) doesn't depend on any timezone setting, so it
   // can't drift from the user's midnight the way startOfDay() does when the Jira
   // profile's timezone is wrong. No clock (old extension): fall back to startOfDay().
-  if (mode !== 'checkin') {
+  if (mode !== 'checkin' && mode !== 'open') {
     clauses.push(clock
       ? `status CHANGED AFTER -${Math.max(1, clock.minutesSinceMidnight)}m`
       : 'status CHANGED AFTER startOfDay()');
@@ -334,6 +337,7 @@ export async function issuesForMode(conn, { mode = 'checkout', storyPointsField,
       statusCategory: category,
       done: category === 'done',
       issueType: f.issuetype?.name || null,
+      priority: f.priority ? { id: f.priority.id || null, name: f.priority.name || null, iconUrl: f.priority.iconUrl || null } : null,
       parentKey: f.parent?.key || null,
       parentSummary: f.parent?.fields?.summary || null,
       storyPoints: storyPointsField ? (f[storyPointsField] ?? null) : null,
@@ -515,6 +519,7 @@ export async function monthWeight(conn, { storyPointsField, onTokens, clock, tar
         statusCategory: cat,
         done: cat === 'done',
         issueType: f.issuetype?.name || null,
+      priority: f.priority ? { id: f.priority.id || null, name: f.priority.name || null, iconUrl: f.priority.iconUrl || null } : null,
         isBug: /bug/i.test(f.issuetype?.name || ''),
         storyPoints: pointsOf(i),
         doneDate: doneDateOf(f, clock.offsetMin),

@@ -491,6 +491,45 @@ app.get('/jira/board', async (req, res) => {
   }
 });
 
+// Everything assigned to me in the open sprint that isn't done, with priority, for
+// Pip's dock on every tab. The extension sorts and groups; this just fetches.
+app.get('/jira/open', async (req, res) => {
+  const auth = await requireAuth(req, res);
+  if (!auth) return;
+  try {
+    const me = await whoAmI(auth.client);
+    const user = auth.user || await upsertUser(me.userId, me.user);
+    const conn = await getJiraConnection(user.id);
+    if (!conn) return res.json({ connected: false, issues: [] });
+
+    const onTokens = (t) => updateJiraTokens(user.id, t);
+    let spField = conn.story_points_field;
+    if (!spField) {
+      try {
+        spField = await findStoryPointsField(conn, { onTokens });
+        if (spField) await setJiraStoryPointsField(user.id, spField);
+      } catch { /* non-fatal */ }
+    }
+    let issueTypes = (conn.issue_types || '').split(',').map((x) => x.trim()).filter(Boolean);
+    if (!issueTypes.length) {
+      try {
+        issueTypes = await findSubtaskIssueTypes(conn, { onTokens });
+        if (issueTypes.length) await setJiraIssueTypes(user.id, issueTypes);
+      } catch { /* fall back to subTaskIssueTypes() in the JQL */ }
+    }
+    const issues = await issuesForMode(conn, {
+      mode: 'open', storyPointsField: spField, issueTypes, onTokens, clock: clockFromRequest(req),
+    });
+    res.json({ connected: true, siteName: conn.site_name, issues: issues.map(({ descriptionText, ...i }) => i) });
+  } catch (e) {
+    if (e.message === 'JIRA_UNAUTHORISED') {
+      return res.status(409).json({ error: 'Jira access expired — reconnect Jira in Settings.' });
+    }
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // The tickets behind this month's total, for the modal's side panel. Same query as
 // /jira/month plus descriptions; only called when the panel is opened.
 app.get('/jira/month/tasks', async (req, res) => {
