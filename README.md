@@ -65,7 +65,8 @@ Copy `.env.example` to `.env` and fill it in. The ones that matter:
 | `GET /me/task-weight` | My positions (`{ positions: [{ id, name, weight }], activeId }`) — weight is the month's 100% story-point target |
 | `POST /me/task-weight` | Save positions + which one is current; `/jira/month` returns the current one as `target` |
 | `GET /jira/board` | Both ticket lists in one call: `today` (sprint sub-tasks that moved today, `doneToday` = points earned today) and `next` (still To Do / In Progress) |
-| `GET /me/prefs` · `POST /me/prefs` | Per-user switches: `slackPosting` (off = read-only Jira view, no Slack) and `startReminder` |
+| `GET /me/prefs` · `POST /me/prefs` | Per-user switches: `slackPosting` (off = read-only Jira view, no Slack), `startReminder`, `finishReminder` |
+| `GET /day/finished` | Has today's "before you finish work" been posted (via WorkLog or straight in Slack)? |
 | `POST /me/snapshot` | Save the day's numbers (points, run rate, needed, on pace…) to `daily_stats`, one row per user per day |
 | `GET /day/checkin` | Items still open on the last day worked, + today's thread |
 | `POST /day/start` | Posts the start-work message into that thread |

@@ -574,7 +574,7 @@ function cleanTaskWeight(body) {
 
 // ---- Per-user prefs ----
 // slackPosting: false turns the modal into a read-only Jira view (no Slack reads or
-// posts); startReminder: false silences Pip's start-work nudge.
+// posts); startReminder / finishReminder: false silence Pip's start- and finish-work nudges.
 app.get('/me/prefs', async (req, res) => {
   const auth = await requireAuth(req, res);
   if (!auth) return;
@@ -591,7 +591,7 @@ app.post('/me/prefs', async (req, res) => {
   if (!auth) return;
   try {
     const patch = {};
-    for (const k of ['slackPosting', 'startReminder']) {
+    for (const k of ['slackPosting', 'startReminder', 'finishReminder']) {
       if (typeof req.body?.[k] === 'boolean') patch[k] = req.body[k];
     }
     res.json(await setPrefs(auth.user.id, patch));
@@ -889,6 +889,26 @@ app.get('/day/today', async (req, res) => {
         order: i,
       })),
     });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// --- Has today's "before you finish work" gone up? (for Pip's finish reminder) ---
+// Either we posted it (daily_logs has a finish ts for the user's today) or the user
+// wrote it straight in Slack — their newest finish post is from after their midnight.
+app.get('/day/finished', async (req, res) => {
+  const auth = await requireAuth(req, res);
+  if (!auth) return;
+  try {
+    const clock = clockFromRequest(req);
+    const me = await whoAmI(auth.client);
+    const user = auth.user || await upsertUser(me.userId, me.user);
+    const local = await getDayLog(user.id, todayISO(clock));
+    if (local?.finish_post_ts) return res.json({ posted: true, via: 'worklog' });
+    const last = await findLastPost(auth.client, FINISH_HEADER, { beforeToday: false, clock });
+    res.json({ posted: !!last && Number(last.ts) >= clock.startOfDayEpoch, via: last ? 'slack' : null });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: e.message });

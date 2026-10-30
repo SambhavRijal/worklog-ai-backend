@@ -183,7 +183,7 @@ export const SCHEMA_SQL = `
     -- Task-weight positions ({ positions: [{ id, name, weight }], activeId }): each
     -- position's weight is the month's 100% story-point target.
     ALTER TABLE users ADD COLUMN IF NOT EXISTS task_weight JSONB;
-    -- Per-user switches ({ slackPosting, startReminder }); missing keys mean defaults.
+    -- Per-user switches ({ slackPosting, startReminder, finishReminder }); missing keys mean defaults.
     ALTER TABLE users ADD COLUMN IF NOT EXISTS prefs JSONB;
 ${DAILY_STATS_SQL}
 `;
@@ -286,7 +286,7 @@ function ensureTaskWeightColumn() {
 const EMPTY_TASK_WEIGHT = { positions: [], activeId: null };
 
 // --- Per-user prefs ---
-export const DEFAULT_PREFS = { slackPosting: true, startReminder: true };
+export const DEFAULT_PREFS = { slackPosting: true, startReminder: true, finishReminder: true };
 
 let prefsColumn;
 function ensurePrefsColumn() {
