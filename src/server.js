@@ -491,6 +491,30 @@ app.get('/jira/board', async (req, res) => {
   }
 });
 
+// The tickets behind this month's total, for the modal's side panel. Same query as
+// /jira/month plus descriptions; only called when the panel is opened.
+app.get('/jira/month/tasks', async (req, res) => {
+  const auth = await requireAuth(req, res);
+  if (!auth) return;
+  try {
+    const me = await whoAmI(auth.client);
+    const user = auth.user || await upsertUser(me.userId, me.user);
+    const conn = await getJiraConnection(user.id);
+    if (!conn) return res.json({ connected: false, issues: [] });
+    const onTokens = (t) => updateJiraTokens(user.id, t);
+    const out = await monthWeight(conn, {
+      storyPointsField: conn.story_points_field, onTokens, clock: clockFromRequest(req), includeIssues: true,
+    });
+    res.json({ connected: true, found: out.found, field: out.field, month: out.month, points: out.points, issues: out.issues || [] });
+  } catch (e) {
+    if (e.message === 'JIRA_UNAUTHORISED') {
+      return res.status(409).json({ error: 'Jira access expired — reconnect Jira in Settings.' });
+    }
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // This month's task weight: story points on my issues whose "Task Weight Counted As"
 // falls in the current month. Independent of sprint and of the page the modal is on.
 // "This month" is the user's month (X-TZ-Offset header, or ?tz= — see clock.js).

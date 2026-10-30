@@ -176,6 +176,39 @@ const jqlString = (v) => `"${String(v).replace(/\\/g, '\\\\').replace(/"/g, '\\"
 // When did this ticket reach Done? statuscategorychangedate is when it last changed
 // status CATEGORY, so it's the Done moment for anything currently Done; resolutiondate
 // covers workflows that set a resolution instead.
+// Jira descriptions are Atlassian Document Format (a JSON tree), or a plain string on
+// older APIs. Flatten to text — enough to know whether there is one and to preview it.
+export function adfToText(node, max = 600) {
+  if (node == null) return '';
+  if (typeof node === 'string') return node.slice(0, max);
+  const out = [];
+  let len = 0;
+  const BLOCK = new Set(['paragraph', 'heading', 'listItem', 'blockquote', 'codeBlock', 'rule', 'tableRow']);
+  (function walk(n) {
+    if (!n || len >= max) return;
+    if (n.type === 'text' && n.text) { out.push(n.text); len += n.text.length; }
+    else if (n.type === 'hardBreak') out.push('\n');
+    else if (n.type === 'mention') out.push(n.attrs?.text || '@someone');
+    else if (n.type === 'inlineCard') out.push(n.attrs?.url || '');
+    for (const c of n.content || []) walk(c);
+    if (BLOCK.has(n.type)) out.push('\n');
+  })(node);
+  return out.join('').replace(/\n{3,}/g, '\n\n').trim().slice(0, max);
+}
+
+// What every ticket list shows beyond key/summary/status: time against estimate and
+// whether it has a description (with a short preview for the expand toggle).
+function ticketExtras(f) {
+  const text = adfToText(f.description);
+  return {
+    timeSpentSeconds: f.timespent ?? null,
+    estimateSeconds: f.timeoriginalestimate ?? null,
+    hasDescription: text.length > 0,
+    descriptionText: text || null,
+  };
+}
+const EXTRA_FIELDS = ['timespent', 'timeoriginalestimate', 'description'];
+
 function doneDateOf(f, offsetMin) {
   if (f?.status?.statusCategory?.key !== 'done') return null;
   return localDate(f.statuscategorychangedate || f.resolutiondate, offsetMin);
@@ -276,7 +309,7 @@ export async function runJql(conn, jql, opts, { limit = 10 } = {}) {
 // Sprint-scoped sub-tasks assigned to me, filtered by mode. Normalised for the extension.
 export async function issuesForMode(conn, { mode = 'checkout', storyPointsField, issueTypes, onTokens, clock = null } = {}) {
   const opts = { onTokens };
-  const fields = ['summary', 'status', 'issuetype', 'priority', 'timespent', 'parent', 'statuscategorychangedate', 'resolutiondate'];
+  const fields = ['summary', 'status', 'issuetype', 'priority', 'parent', 'statuscategorychangedate', 'resolutiondate', ...EXTRA_FIELDS];
   if (storyPointsField) fields.push(storyPointsField);
 
   let data;
@@ -304,7 +337,7 @@ export async function issuesForMode(conn, { mode = 'checkout', storyPointsField,
       parentKey: f.parent?.key || null,
       parentSummary: f.parent?.fields?.summary || null,
       storyPoints: storyPointsField ? (f[storyPointsField] ?? null) : null,
-      timeSpentSeconds: f.timespent ?? null,
+      ...ticketExtras(f),
       // Moved to Done today (user's day) — these are the points earned today.
       doneToday: !!clock && doneDateOf(f, clock.offsetMin) === clock.today,
       url: site ? `${site}/browse/${i.key}` : null,
@@ -374,7 +407,7 @@ function valueInMonth(raw, year, month0) {
   return named === month0 && (!y || +y[1] === year);
 }
 
-export async function monthWeight(conn, { storyPointsField, onTokens, clock, target = null } = {}) {
+export async function monthWeight(conn, { storyPointsField, onTokens, clock, target = null, includeIssues = false } = {}) {
   const opts = { onTokens };
   const found = await findMonthWeightFields(conn, opts);
   if (!found.month.length) return { found: false };
@@ -387,6 +420,8 @@ export async function monthWeight(conn, { storyPointsField, onTokens, clock, tar
   const fields = [
     'summary', 'issuetype', 'status', 'timespent', 'timeoriginalestimate',
     'statuscategorychangedate', 'resolutiondate', ...spIds, ...found.month.map((f) => f.id),
+    // Descriptions can be large, so only when the ticket list is actually wanted.
+    ...(includeIssues ? ['description'] : []),
   ];
   // The user's month, from their clock — not the server's or Jira's.
   const year = clock.year;
@@ -467,6 +502,27 @@ export async function monthWeight(conn, { storyPointsField, onTokens, clock, tar
     estimateSeconds,
     storyPointsFieldUsed: best,
     pace,
+    // The tickets behind the total — only on request (the "where does this come from"
+    // side panel), newest Done first, then the rest by key.
+    ...(includeIssues ? { issues: [...byKey.values()].map((i) => {
+      const f = i.fields || {};
+      const cat = f.status?.statusCategory?.key || '';
+      const counted = found.month.map((m) => f[m.id]).find((v) => v != null);
+      return {
+        key: i.key,
+        summary: f.summary || '',
+        status: f.status?.name || '',
+        statusCategory: cat,
+        done: cat === 'done',
+        issueType: f.issuetype?.name || null,
+        isBug: /bug/i.test(f.issuetype?.name || ''),
+        storyPoints: pointsOf(i),
+        doneDate: doneDateOf(f, clock.offsetMin),
+        countedAt: typeof counted === 'string' ? counted : (counted?.value ?? counted?.name ?? null),
+        ...ticketExtras(f),
+        url: site ? `${site}/browse/${i.key}` : null,
+      };
+    }).sort((a, b) => (b.doneDate || '').localeCompare(a.doneDate || '') || a.key.localeCompare(b.key, undefined, { numeric: true })) } : {}),
     // For diagnosing a zero: which fields were considered.
     fieldsChecked: { month: found.month, points: spIds },
   };

@@ -64,6 +64,7 @@ Copy `.env.example` to `.env` and fill it in. The ones that matter:
 | `GET /jira/month` | Story points this month — issues whose "Task Weight Counted As" falls in the current month (`?tz=` minutes east of UTC) |
 | `GET /me/task-weight` | My positions (`{ positions: [{ id, name, weight }], activeId }`) — weight is the month's 100% story-point target |
 | `POST /me/task-weight` | Save positions + which one is current; `/jira/month` returns the current one as `target` |
+| `GET /jira/month/tasks` | The tickets behind this month's total (counted-at value, points, status, time vs estimate, description preview) — for the modal's side panel, fetched only when opened |
 | `GET /jira/board` | Both ticket lists in one call: `today` (sprint sub-tasks that moved today, `doneToday` = points earned today) and `next` (still To Do / In Progress) |
 | `GET /me/prefs` · `POST /me/prefs` | Per-user switches: `slackPosting` (off = read-only Jira view, no Slack), `startReminder`, `finishReminder`, `punchInModal` |
 | `GET /day/finished` | Has today's "before you finish work" been posted (via WorkLog or straight in Slack)? |
