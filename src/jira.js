@@ -144,7 +144,7 @@ export async function findSubtaskIssueTypes(conn, opts) {
 
 // Story points live in a custom field whose id differs per site, so find it by name.
 export async function findStoryPointsField(conn, opts) {
-  const fields = await callJira(conn, '/rest/api/3/field', opts);
+  const fields = await jiraFieldList(conn, opts);
   const match = (fields || []).find((f) =>
     /^story\s*points?(\s*estimate)?$/i.test((f.name || '').trim())
   );
@@ -361,8 +361,19 @@ export async function issuesForMode(conn, { mode = 'checkout', storyPointsField,
 // Discovered by name because the custom field id differs per site.
 // Sites often carry several same-named fields (company- and team-managed copies), and
 // only one of them is actually filled in — so collect every match, not the first.
-export async function findMonthWeightFields(conn, opts) {
+// Jira's field list rarely changes and is the same for everyone on a site: keep it in
+// memory for an hour instead of fetching it on every modal open.
+const fieldCache = new Map();   // cloud_id -> { at, fields }
+async function jiraFieldList(conn, opts) {
+  const hit = fieldCache.get(conn.cloud_id);
+  if (hit && Date.now() - hit.at < 3600000) return hit.fields;
   const fields = await callJira(conn, '/rest/api/3/field', opts);
+  fieldCache.set(conn.cloud_id, { at: Date.now(), fields });
+  return fields;
+}
+
+export async function findMonthWeightFields(conn, opts) {
+  const fields = await jiraFieldList(conn, opts);
   const pick = (re) => (fields || [])
     .filter((f) => re.test((f.name || '').trim()))
     .map((f) => ({ id: f.id, name: f.name, type: f.schema?.type || null }));
@@ -439,22 +450,29 @@ export async function monthWeight(conn, { storyPointsField, onTokens, clock, tar
   const otherFields = found.month.filter((f) => !dateFields.includes(f));
   const byKey = new Map();
 
-  if (dateFields.length) {
-    // Explicit dates for the user's month rather than startOfMonth(), which follows
-    // the Jira profile's timezone. Date fields carry no time, so these are exact.
-    const range = dateFields
-      .map((f) => `(${cfRef(f)} >= "${clock.monthStart}" AND ${cfRef(f)} < "${clock.nextMonthStart}")`)
-      .join(' OR ');
-    const jql = `assignee = currentUser() AND (${range})`;
-    for (const i of await searchAll(conn, { jql, fields, opts })) byKey.set(i.key, i);
-  }
-  if (otherFields.length) {
-    // Select/text: JQL can't range over it, so fetch mine with a value and match here.
-    const any = otherFields.map((f) => `${cfRef(f)} IS NOT EMPTY`).join(' OR ');
-    const jql = `assignee = currentUser() AND (${any}) AND updated >= -100d`;
-    for (const i of await searchAll(conn, { jql, fields, opts })) {
-      if (otherFields.some((f) => valueInMonth(i.fields?.[f.id], year, month0))) byKey.set(i.key, i);
-    }
+  // Both searches at once: they don't depend on each other.
+  const [dated, other] = await Promise.all([
+    dateFields.length
+      // Explicit dates for the user's month rather than startOfMonth(), which follows
+      // the Jira profile's timezone. Date fields carry no time, so these are exact.
+      ? searchAll(conn, {
+        jql: `assignee = currentUser() AND (${dateFields
+          .map((f) => `(${cfRef(f)} >= "${clock.monthStart}" AND ${cfRef(f)} < "${clock.nextMonthStart}")`)
+          .join(' OR ')})`,
+        fields, opts,
+      })
+      : [],
+    otherFields.length
+      // Select/text: JQL can't range over it, so fetch mine with a value and match here.
+      ? searchAll(conn, {
+        jql: `assignee = currentUser() AND (${otherFields.map((f) => `${cfRef(f)} IS NOT EMPTY`).join(' OR ')}) AND updated >= -100d`,
+        fields, opts,
+      })
+      : [],
+  ]);
+  for (const i of dated) byKey.set(i.key, i);
+  for (const i of other) {
+    if (otherFields.some((f) => valueInMonth(i.fields?.[f.id], year, month0))) byKey.set(i.key, i);
   }
 
   // Per issue, the first story-points field that holds a number.

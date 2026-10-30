@@ -285,8 +285,8 @@ app.post('/auth/jira/start', async (req, res) => {
     if (!jiraConfigured()) {
       return res.status(503).json({ error: 'Jira is not configured on this server (JIRA_CLIENT_ID / JIRA_CLIENT_SECRET).' });
     }
-    const me = await whoAmI(auth.client);
-    const user = auth.user || await upsertUser(me.userId, me.user);
+    // Who: the session already says; ask Slack only for a session without a user row.
+    const user = auth.user || await (async () => { const me = await whoAmI(auth.client); return upsertUser(me.userId, me.user); })();
     const state = 'jira_' + randomUUID().replace(/-/g, '');
     await createJiraAuthState(state, user.id);
     res.json({ state, authUrl: jiraAuthUrl({ redirectUri: JIRA_REDIRECT_URI, state }) });
@@ -375,8 +375,8 @@ app.get('/jira/status', async (req, res) => {
   const auth = await requireAuth(req, res);
   if (!auth) return;
   try {
-    const me = await whoAmI(auth.client);
-    const user = auth.user || await upsertUser(me.userId, me.user);
+    // Who: the session already says; ask Slack only for a session without a user row.
+    const user = auth.user || await (async () => { const me = await whoAmI(auth.client); return upsertUser(me.userId, me.user); })();
     const conn = await getJiraConnection(user.id);
     res.json({
       configured: jiraConfigured(),
@@ -415,8 +415,8 @@ app.get('/jira/today', async (req, res) => {
   const auth = await requireAuth(req, res);
   if (!auth) return;
   try {
-    const me = await whoAmI(auth.client);
-    const user = auth.user || await upsertUser(me.userId, me.user);
+    // Who: the session already says; ask Slack only for a session without a user row.
+    const user = auth.user || await (async () => { const me = await whoAmI(auth.client); return upsertUser(me.userId, me.user); })();
     const conn = await getJiraConnection(user.id);
     if (!conn) return res.json({ connected: false, issues: [] });
 
@@ -508,8 +508,8 @@ app.get('/jira/open', async (req, res) => {
   const auth = await requireAuth(req, res);
   if (!auth) return;
   try {
-    const me = await whoAmI(auth.client);
-    const user = auth.user || await upsertUser(me.userId, me.user);
+    // Who: the session already says; ask Slack only for a session without a user row.
+    const user = auth.user || await (async () => { const me = await whoAmI(auth.client); return upsertUser(me.userId, me.user); })();
     const conn = await getJiraConnection(user.id);
     if (!conn) return res.json({ connected: false, issues: [] });
 
@@ -639,8 +639,8 @@ app.get('/jira/month/tasks', async (req, res) => {
   const auth = await requireAuth(req, res);
   if (!auth) return;
   try {
-    const me = await whoAmI(auth.client);
-    const user = auth.user || await upsertUser(me.userId, me.user);
+    // Who: the session already says; ask Slack only for a session without a user row.
+    const user = auth.user || await (async () => { const me = await whoAmI(auth.client); return upsertUser(me.userId, me.user); })();
     const conn = await getJiraConnection(user.id);
     if (!conn) return res.json({ connected: false, issues: [] });
     const onTokens = (t) => updateJiraTokens(user.id, t);
@@ -664,8 +664,8 @@ app.get('/jira/month', async (req, res) => {
   const auth = await requireAuth(req, res);
   if (!auth) return;
   try {
-    const me = await whoAmI(auth.client);
-    const user = auth.user || await upsertUser(me.userId, me.user);
+    // Who: the session already says; ask Slack only for a session without a user row.
+    const user = auth.user || await (async () => { const me = await whoAmI(auth.client); return upsertUser(me.userId, me.user); })();
     const conn = await getJiraConnection(user.id);
     if (!conn) return res.json({ connected: false });
 
@@ -833,8 +833,8 @@ app.get('/jira/sites', async (req, res) => {
   const auth = await requireAuth(req, res);
   if (!auth) return;
   try {
-    const me = await whoAmI(auth.client);
-    const user = auth.user || await upsertUser(me.userId, me.user);
+    // Who: the session already says; ask Slack only for a session without a user row.
+    const user = auth.user || await (async () => { const me = await whoAmI(auth.client); return upsertUser(me.userId, me.user); })();
     const conn = await getJiraConnection(user.id);
     if (!conn) return res.json({ connected: false, sites: [] });
     const sites = await accessibleResources(conn.access_token);
@@ -856,8 +856,8 @@ app.post('/jira/site', async (req, res) => {
   try {
     const { cloudId } = req.body || {};
     if (!cloudId) return res.status(400).json({ error: 'cloudId is required' });
-    const me = await whoAmI(auth.client);
-    const user = auth.user || await upsertUser(me.userId, me.user);
+    // Who: the session already says; ask Slack only for a session without a user row.
+    const user = auth.user || await (async () => { const me = await whoAmI(auth.client); return upsertUser(me.userId, me.user); })();
     const conn = await getJiraConnection(user.id);
     if (!conn) return res.status(400).json({ error: 'Jira is not connected.' });
 
@@ -887,8 +887,8 @@ app.get('/jira/probe', async (req, res) => {
   const auth = await requireAuth(req, res);
   if (!auth) return;
   try {
-    const me = await whoAmI(auth.client);
-    const user = auth.user || await upsertUser(me.userId, me.user);
+    // Who: the session already says; ask Slack only for a session without a user row.
+    const user = auth.user || await (async () => { const me = await whoAmI(auth.client); return upsertUser(me.userId, me.user); })();
     const conn = await getJiraConnection(user.id);
     if (!conn) return res.json({ connected: false });
     const onTokens = (t) => updateJiraTokens(user.id, t);
@@ -952,8 +952,8 @@ app.post('/me/delete', async (req, res) => {
   const auth = await requireAuth(req, res);
   if (!auth) return;
   try {
-    const me = await whoAmI(auth.client);
-    const user = auth.user || await upsertUser(me.userId, me.user);
+    // Who: the session already says; ask Slack only for a session without a user row.
+    const user = auth.user || await (async () => { const me = await whoAmI(auth.client); return upsertUser(me.userId, me.user); })();
 
     // Best effort: hand the Slack token back before dropping it, so it stops working
     // even if a copy leaked. A failure here must not block the deletion.
@@ -1070,8 +1070,8 @@ app.get('/day/finished', async (req, res) => {
   if (!auth) return;
   try {
     const clock = clockFromRequest(req);
-    const me = await whoAmI(auth.client);
-    const user = auth.user || await upsertUser(me.userId, me.user);
+    // Who: the session already says; ask Slack only for a session without a user row.
+    const user = auth.user || await (async () => { const me = await whoAmI(auth.client); return upsertUser(me.userId, me.user); })();
     const local = await getDayLog(user.id, todayISO(clock));
     if (local?.finish_post_ts) return res.json({ posted: true, via: 'worklog' });
     const last = await findLastPost(auth.client, FINISH_HEADER, { beforeToday: false, clock });
@@ -1141,8 +1141,8 @@ app.post('/day/start', async (req, res) => {
       });
     }
 
-    const me = await whoAmI(auth.client);
-    const user = auth.user || await upsertUser(me.userId, me.user);
+    // Who: the session already says; ask Slack only for a session without a user row.
+    const user = auth.user || await (async () => { const me = await whoAmI(auth.client); return upsertUser(me.userId, me.user); })();
 
     const plan = items.map((it) => ({ ...it, status: null })); // plans post without icons
     const text = composeFinishMessage({ header: START_HEADER, items: plan, achievements: '' });
@@ -1176,8 +1176,8 @@ app.post('/day/post', async (req, res) => {
     } = req.body;
     if (!channelId || !threadTs) return res.status(400).json({ error: 'channelId and threadTs are required' });
 
-    const me = await whoAmI(auth.client);
-    const user = auth.user || await upsertUser(me.userId, me.user);
+    // Who: the session already says; ask Slack only for a session without a user row.
+    const user = auth.user || await (async () => { const me = await whoAmI(auth.client); return upsertUser(me.userId, me.user); })();
 
     // Achievements post only when the user toggled it on. Mood is never posted.
     // Either way, both are stored in the DB below.
