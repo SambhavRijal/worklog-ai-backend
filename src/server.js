@@ -31,6 +31,7 @@ import 'dotenv/config';
 import { randomUUID, createHmac, timingSafeEqual } from 'node:crypto';
 import express from 'express';
 import cors from 'cors';
+import webpush from 'web-push';
 
 import {
   pool, upsertUser, saveUserToken, createSession, getUserBySession,
@@ -39,6 +40,7 @@ import {
   setJiraStoryPointsField, setJiraIssueTypes, getTaskWeight, setTaskWeight, getPrefs, setPrefs, saveDailyStats, createJiraAuthState, getJiraAuthState,
   finishJiraAuthState, takeJiraAuthResult, deleteUserData,
   getJiraWatch, saveJiraWatch, deleteJiraWatch, markJiraChanged,
+  savePushSub, deletePushSub, pushSubsFor,
 } from './db.js';
 import {
   makeClient, exchangeCode, whoAmI, findMorningPost, findLastPost,
@@ -624,11 +626,61 @@ app.post('/jira/webhook', async (req, res) => {
     return res.status(401).json({ error: 'unauthorised' });
   }
   try {
-    await markJiraChanged(affectedAccounts(req.body));
+    const userIds = await markJiraChanged(affectedAccounts(req.body));
+    await pushTo(userIds, { type: 'jira-changed', at: Date.now() });
   } catch (e) {
     console.error('Jira webhook:', e.message);
   }
   res.status(204).end();
+});
+
+// ---- Web Push: the backend wakes the extension instead of the extension asking ----
+// When Jira reports a change, every browser of the people affected gets a silent
+// push; the extension refetches and updates Pip. No polling in between. Keys come
+// from VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY / VAPID_SUBJECT (see .env.example).
+const pushReady = !!(process.env.VAPID_PUBLIC_KEY && process.env.VAPID_PRIVATE_KEY);
+if (pushReady) {
+  webpush.setVapidDetails(process.env.VAPID_SUBJECT || 'mailto:admin@example.com', process.env.VAPID_PUBLIC_KEY, process.env.VAPID_PRIVATE_KEY);
+}
+async function pushTo(userIds, payload) {
+  if (!pushReady || !userIds?.length) return;
+  const subs = await pushSubsFor(userIds).catch(() => []);
+  await Promise.all(subs.map(async (row) => {
+    try {
+      await webpush.sendNotification(row.sub, JSON.stringify(payload), { TTL: 120, urgency: 'high' });
+    } catch (e) {
+      // Gone (uninstalled, cleared): forget it. Anything else: try again next time.
+      if (e.statusCode === 404 || e.statusCode === 410) await deletePushSub(row.endpoint).catch(() => {});
+      else console.warn('push failed', e.statusCode || e.message);
+    }
+  }));
+}
+
+// The public key the extension subscribes with (not a secret).
+app.get('/push/key', (_req, res) => res.json({ key: pushReady ? process.env.VAPID_PUBLIC_KEY : null }));
+
+app.post('/me/push', async (req, res) => {
+  const auth = await requireAuth(req, res);
+  if (!auth) return;
+  const sub = req.body?.subscription;
+  if (!sub?.endpoint || !sub?.keys?.p256dh || !sub?.keys?.auth) return res.status(400).json({ error: 'Bad subscription' });
+  try {
+    await savePushSub(auth.user.id, { endpoint: sub.endpoint, keys: { p256dh: sub.keys.p256dh, auth: sub.keys.auth } });
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/me/push/remove', async (req, res) => {
+  const auth = await requireAuth(req, res);
+  if (!auth) return;
+  try {
+    if (req.body?.endpoint) await deletePushSub(String(req.body.endpoint));
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // The tickets behind this month's total, for the modal's side panel. Same query as

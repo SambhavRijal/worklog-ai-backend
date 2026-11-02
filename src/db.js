@@ -576,6 +576,39 @@ export async function markJiraChanged(accountIds) {
   const ids = [...new Set(accountIds.filter(Boolean))];
   if (!ids.length) return 0;
   await ensureWatchTable();
-  const r = await query('UPDATE jira_watch SET changed_at = now() WHERE account_id = ANY($1)', [ids]);
-  return r.rowCount || 0;
+  const r = await query('UPDATE jira_watch SET changed_at = now() WHERE account_id = ANY($1) RETURNING user_id', [ids]);
+  return (r.rows || []).map((x) => x.user_id);
+}
+
+// --- Web Push: wake the extension when Jira reports a change ---
+// One row per browser that turned Pip on (a person can have several).
+const PUSH_SQL = `
+    CREATE TABLE IF NOT EXISTS push_subs (
+      endpoint    TEXT PRIMARY KEY,
+      user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      sub         JSONB NOT NULL,
+      created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS push_subs_user ON push_subs (user_id);`;
+let pushTable;
+function ensurePushTable() {
+  pushTable ||= query(PUSH_SQL).catch((e) => { pushTable = null; throw e; });
+  return pushTable;
+}
+export async function savePushSub(userId, sub) {
+  await ensurePushTable();
+  await query(
+    `INSERT INTO push_subs (endpoint, user_id, sub) VALUES ($1, $2, $3)
+     ON CONFLICT (endpoint) DO UPDATE SET user_id = EXCLUDED.user_id, sub = EXCLUDED.sub`,
+    [sub.endpoint, userId, JSON.stringify(sub)]
+  );
+}
+export async function deletePushSub(endpoint) {
+  await ensurePushTable();
+  await query('DELETE FROM push_subs WHERE endpoint = $1', [endpoint]);
+}
+export async function pushSubsFor(userIds) {
+  if (!userIds.length) return [];
+  await ensurePushTable();
+  return (await query('SELECT endpoint, sub FROM push_subs WHERE user_id = ANY($1)', [userIds])).rows || [];
 }
