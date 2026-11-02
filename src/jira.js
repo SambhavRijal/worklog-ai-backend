@@ -242,10 +242,14 @@ export function buildJql(mode, { includeSprint = true, issueTypes = null, clock 
   const clauses = ['assignee = currentUser()'];
   if (includeSprint) clauses.push('sprint IN openSprints()');
   // Explicit names when we've discovered them (a superset of subTaskIssueTypes()),
-  // otherwise fall back to the JQL function.
-  clauses.push(issueTypes?.length
-    ? `issuetype IN (${issueTypes.map(jqlString).join(', ')})`
-    : 'issuetype IN subTaskIssueTypes()');
+  // otherwise fall back to the JQL function. Pip's 'open' list is everything on your
+  // plate (a standalone Bug or Task counts too), so it skips this; Epics are dropped
+  // after the search by hierarchy level, which doesn't depend on the type's name.
+  if (mode !== 'open') {
+    clauses.push(issueTypes?.length
+      ? `issuetype IN (${issueTypes.map(jqlString).join(', ')})`
+      : 'issuetype IN subTaskIssueTypes()');
+  }
   // 'open': everything not finished, whatever the team's status names (Pip's dock).
   clauses.push(mode === 'open'
     ? 'statusCategory != Done'
@@ -335,17 +339,19 @@ export async function issuesForMode(conn, { mode = 'checkout', storyPointsField,
 
   let data;
   try {
-    data = await searchIssues(conn, { jql: buildJql(mode, { issueTypes, clock }), fields, opts });
+    data = await searchIssues(conn, { jql: buildJql(mode, { issueTypes, clock }), fields, maxResults: mode === 'open' ? 100 : 50, opts });
   } catch (e) {
     if (e.message === 'JIRA_UNAUTHORISED') throw e;
     // Sites without Jira Software have no Sprint field at all, and openSprints()
     // is then a JQL error rather than an empty result. Retry unscoped so those
     // teams still get their sub-tasks.
-    data = await searchIssues(conn, { jql: buildJql(mode, { includeSprint: false, issueTypes, clock }), fields, opts });
+    data = await searchIssues(conn, { jql: buildJql(mode, { includeSprint: false, issueTypes, clock }), fields, maxResults: mode === 'open' ? 100 : 50, opts });
   }
 
   const site = (conn.site_url || '').replace(/\/$/, '');
-  return (data?.issues || []).map((i) => {
+  return (data?.issues || [])
+    .filter((i) => mode !== 'open' || !((i.fields?.issuetype?.hierarchyLevel ?? 0) > 0))   // no Epics
+    .map((i) => {
     const f = i.fields || {};
     const category = f.status?.statusCategory?.key || ''; // 'new' | 'indeterminate' | 'done'
     return {
