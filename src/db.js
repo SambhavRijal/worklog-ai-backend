@@ -303,7 +303,8 @@ function ensureTaskWeightColumn() {
 const EMPTY_TASK_WEIGHT = { positions: [], activeId: null };
 
 // --- Per-user prefs ---
-export const DEFAULT_PREFS = { slackPosting: true, startReminder: true, finishReminder: true, punchInModal: true, punchOutModal: true };
+// Everything is opt-in: a new person turns on what they want in Settings.
+export const DEFAULT_PREFS = { slackPosting: false, startReminder: false, finishReminder: false, punchInModal: false, punchOutModal: false };
 
 let prefsColumn;
 function ensurePrefsColumn() {
