@@ -308,7 +308,9 @@ const EMPTY_TASK_WEIGHT = { positions: [], activeId: null };
 
 // --- Per-user prefs ---
 // Everything is opt-in: a new person turns on what they want in Settings.
-export const DEFAULT_PREFS = { slackPosting: false, startReminder: false, finishReminder: false, punchInModal: false, punchOutModal: false };
+// remindEvery: minutes between Pip's posting reminders (and from punch-out to the first).
+export const REMIND_EVERY = [5, 10, 15, 20, 30, 45, 60, 90, 120];
+export const DEFAULT_PREFS = { slackPosting: false, startReminder: false, finishReminder: false, punchInModal: false, punchOutModal: false, remindEvery: 15 };
 
 let prefsColumn;
 function ensurePrefsColumn() {

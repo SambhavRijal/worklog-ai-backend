@@ -40,7 +40,7 @@ import {
   setJiraStoryPointsField, setJiraIssueTypes, getTaskWeight, setTaskWeight, getPrefs, setPrefs, saveDailyStats, createJiraAuthState, getJiraAuthState,
   finishJiraAuthState, takeJiraAuthResult, deleteUserData,
   getJiraWatch, saveJiraWatch, deleteJiraWatch, markJiraChanged,
-  savePushSub, deletePushSub, pushSubsFor, getPostChannel, setPostChannel, rememberPostChannelId, normChannel } from './db.js';
+  savePushSub, deletePushSub, pushSubsFor, REMIND_EVERY, getPostChannel, setPostChannel, rememberPostChannelId, normChannel } from './db.js';
 import {
   makeClient, exchangeCode, whoAmI, findMorningPost, findLastPost,
   findTodayThreadAnchor, findMyReplyInThread, postMessage, todayISO,
@@ -819,6 +819,11 @@ app.post('/me/prefs', async (req, res) => {
     const patch = {};
     for (const k of ['slackPosting', 'startReminder', 'finishReminder', 'punchInModal', 'punchOutModal']) {
       if (typeof req.body?.[k] === 'boolean') patch[k] = req.body[k];
+    }
+    if (req.body?.remindEvery != null) {
+      const n = Number(req.body.remindEvery);
+      if (!REMIND_EVERY.includes(n)) return res.status(400).json({ error: `Reminders can be every ${REMIND_EVERY.join(', ')} minutes.` });
+      patch.remindEvery = n;
     }
     // The Slack channel daily updates go to (empty clears it, which stops posting).
     if (typeof req.body?.postChannel === 'string') {
