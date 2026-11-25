@@ -64,7 +64,16 @@ const MARKER = process.env.START_MARKER || 'before you start work';
 const FINISH_HEADER = process.env.FINISH_HEADER || 'Before you finish work';
 const START_HEADER = process.env.START_HEADER || 'Before you start work';
 // Phrase that identifies the daily workflow post everyone replies under.
-const THREAD_ANCHOR = process.env.THREAD_ANCHOR || 'Please report in this thread';
+// Every line must be in the message (lines separated by | in the env var). The
+// frontend team's workflow post says "Today’s task here" then "Please report in this
+// thread." An old single-phrase setting is upgraded, since that phrase alone also
+// turns up in ordinary messages.
+const ANCHOR_DEFAULT = ['Today’s task here', 'Please report in this thread'];
+const THREAD_ANCHOR = (() => {
+  const v = (process.env.THREAD_ANCHOR || '').split('|').map((s) => s.trim()).filter(Boolean);
+  if (!v.length || (v.length === 1 && /^please report in this thread\.?$/i.test(v[0]))) return ANCHOR_DEFAULT;
+  return v;
+})();
 
 // The check-in post has to be findable by the check-out search, which looks for
 // START_MARKER. If the header doesn't contain the marker, that loop silently breaks.

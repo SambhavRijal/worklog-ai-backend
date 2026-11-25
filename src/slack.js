@@ -126,8 +126,11 @@ export async function findMorningPost(client, marker, { clock } = {}) {
 //      IS the parent's ts. Replies are ordinary user messages, so they always show up
 //      in search. This is the dependable path: by the time you punch in, colleagues
 //      have usually posted already.
-//   2. The parent itself — top-level (no thread_ts in the permalink) and either
-//      matching `anchorPhrase` or mentioning BOTH markers, which replies never do.
+//   2. The parent itself — top-level (no thread_ts in the permalink) and containing
+//      every line of `anchorPhrase` (an array: the workflow's own wording, e.g.
+//      "Today’s task here" + "Please report in this thread"). One line alone isn't
+//      enough: people write "please report in this thread" in other messages too.
+//      With no anchor set, a message mentioning BOTH markers counts instead.
 //
 // No `on:` filter: that resolves against Slack's timezone, so instead we sort newest
 // first and cut off at the user's midnight ourselves.
@@ -136,12 +139,25 @@ export async function findTodayThreadAnchor(
 ) {
   // With a channel name, only a thread in that channel counts: no fallback elsewhere.
   const norm = (s) => String(s || '').trim().replace(/^#/, '').toLowerCase();
+  // Compare text loosely: case, curly quotes and line breaks don't matter.
+  const flat = (s) => String(s || '').toLowerCase().replace(/[\u2018\u2019]/g, "'").replace(/\s+/g, ' ').trim();
+  const lines = (Array.isArray(anchorPhrase) ? anchorPhrase : anchorPhrase ? [anchorPhrase] : [])
+    .map(flat).filter(Boolean);
+  const isParent = (raw) => {
+    const text = flat(raw);
+    if (lines.length) return lines.every((l) => text.includes(l));
+    return text.includes(flat(startMarker)) && text.includes(flat(finishMarker));
+  };
   const strict = !!channelName;
   const inChannel = (m) => (preferredChannelId && m.channel?.id === preferredChannelId)
     || (channelName && norm(m.channel?.name) === norm(channelName));
   const since = startOfTodayEpoch(clock);
   const queries = [];
-  if (anchorPhrase) queries.push(`"${anchorPhrase}"`);
+  // Search the longest anchor line without an apostrophe (Slack tokenises those
+  // unpredictably); every line is checked on the results.
+  const searchLine = [...(Array.isArray(anchorPhrase) ? anchorPhrase : anchorPhrase ? [anchorPhrase] : [])]
+    .map((l) => String(l).replace(/[.]+$/, '')).filter((l) => !/['\u2019]/.test(l)).sort((a, b) => b.length - a.length)[0];
+  if (searchLine) queries.push(`"${searchLine}"`);
   queries.push(`"${startMarker}"`);
   if (finishMarker) queries.push(`"${finishMarker}"`);
 
@@ -168,11 +184,7 @@ export async function findTodayThreadAnchor(
       if (replyThreadTs) {
         hit = { channelId: m.channel?.id, channelName: m.channel?.name || null, ts: replyThreadTs, viaReply: true, permalink: m.permalink };
       } else {
-        const text = (m.text || '').toLowerCase();
-        const isAnchor = anchorPhrase && text.includes(anchorPhrase.toLowerCase());
-        const hasBothMarkers =
-          text.includes(startMarker.toLowerCase()) && text.includes(finishMarker.toLowerCase());
-        if (isAnchor || hasBothMarkers) {
+        if (isParent(m.text)) {
           hit = { channelId: m.channel?.id, channelName: m.channel?.name || null, ts: m.ts, viaReply: false, permalink: m.permalink };
         }
       }
@@ -196,11 +208,7 @@ export async function findTodayThreadAnchor(
         channel: preferredChannelId, oldest: String(since), limit: 100,
       });
       for (const m of hist?.messages || []) {
-        const text = (m.text || '').toLowerCase();
-        const isAnchor = anchorPhrase && text.includes(anchorPhrase.toLowerCase());
-        const hasBothMarkers =
-          text.includes(startMarker.toLowerCase()) && text.includes(finishMarker.toLowerCase());
-        if (isAnchor || hasBothMarkers) {
+        if (isParent(m.text)) {
           // conversations.history returns thread parents, not replies.
           return { channelId: preferredChannelId, ts: m.thread_ts || m.ts, viaHistory: true };
         }

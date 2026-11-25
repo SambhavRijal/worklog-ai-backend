@@ -14,7 +14,7 @@ import { makeClient, findTodayThreadAnchor } from '../src/slack.js';
 
 const MARKER = process.env.START_MARKER || 'before you start work';
 const FINISH_HEADER = process.env.FINISH_HEADER || 'Before you finish work';
-const THREAD_ANCHOR = process.env.THREAD_ANCHOR || 'Please report in this thread';
+const THREAD_ANCHOR = (process.env.THREAD_ANCHOR || 'Today’s task here|Please report in this thread').split('|').map((s) => s.trim()).filter(Boolean);
 
 const user = (await pool.query(
   'SELECT * FROM users WHERE access_token IS NOT NULL ORDER BY id DESC LIMIT 1'
@@ -34,7 +34,7 @@ const threadTsFromPermalink = (p) => {
   try { return new URL(p).searchParams.get('thread_ts'); } catch { return null; }
 };
 
-for (const query of [`"${THREAD_ANCHOR}"`, `"${MARKER}"`, `"${FINISH_HEADER}"`]) {
+for (const query of [`"Please report in this thread"`, `"${MARKER}"`, `"${FINISH_HEADER}"`]) {
   console.log(`\n=== query: ${query} ===`);
   try {
     const res = await client.search.messages({ query, sort: 'timestamp', sort_dir: 'desc', count: 20 });
