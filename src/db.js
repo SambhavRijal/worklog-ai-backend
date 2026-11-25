@@ -201,6 +201,10 @@ export const SCHEMA_SQL = `
     ALTER TABLE users ADD COLUMN IF NOT EXISTS task_weight JSONB;
     -- Per-user switches ({ slackPosting, startReminder, finishReminder, punchInModal, punchOutModal }); missing keys mean defaults.
     ALTER TABLE users ADD COLUMN IF NOT EXISTS prefs JSONB;
+    -- The Slack channel this person's daily updates go to (name, as typed in
+    -- Settings), and its id once we've seen the thread there. No channel, no posting.
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS post_channel TEXT;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS post_channel_id TEXT;
 ${DAILY_STATS_SQL}
 ${JIRA_WATCH_SQL}
 `;
@@ -323,6 +327,42 @@ export async function setPrefs(userId, patch) {
   const next = { ...(await getPrefs(userId)), ...patch };
   await query('UPDATE users SET prefs = $2 WHERE id = $1', [userId, JSON.stringify(next)]);
   return next;
+}
+
+// --- Where daily updates are posted ---
+// Posting is made for one team's daily thread (the frontend team's, in
+// #frontend-daily-collaboration). Nobody posts until their channel is set, either
+// by scripts/set-channel.js for the existing team or by typing it in Settings.
+export const normChannel = (s) => String(s || '').trim().replace(/^#/, '').toLowerCase();
+
+let channelColumns;
+function ensureChannelColumns() {
+  channelColumns ||= query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS post_channel TEXT;
+                            ALTER TABLE users ADD COLUMN IF NOT EXISTS post_channel_id TEXT;`)
+    .catch((e) => { channelColumns = null; throw e; });
+  return channelColumns;
+}
+
+export async function getPostChannel(userId) {
+  await ensureChannelColumns();
+  const row = await one('SELECT post_channel, post_channel_id FROM users WHERE id = $1', [userId]);
+  return { name: row?.post_channel || null, id: row?.post_channel_id || null };
+}
+
+// A new name forgets the old id: it's learned again from the new channel's thread.
+export async function setPostChannel(userId, name) {
+  await ensureChannelColumns();
+  const n = normChannel(name) || null;
+  await query(
+    `UPDATE users SET post_channel = $2,
+       post_channel_id = CASE WHEN post_channel IS NOT DISTINCT FROM $2 THEN post_channel_id ELSE NULL END
+     WHERE id = $1`, [userId, n]);
+  return getPostChannel(userId);
+}
+
+export async function rememberPostChannelId(userId, id) {
+  await ensureChannelColumns();
+  await query('UPDATE users SET post_channel_id = $2 WHERE id = $1 AND post_channel_id IS DISTINCT FROM $2', [userId, id]);
 }
 
 // --- Daily history ---

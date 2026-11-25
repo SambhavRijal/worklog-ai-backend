@@ -104,6 +104,7 @@ export async function findMorningPost(client, marker, { clock } = {}) {
 
   return {
     channelId: m.channel?.id,
+    channelName: m.channel?.name || null,
     ts: m.ts,
     threadTs,
     text: m.text || '',
@@ -131,8 +132,13 @@ export async function findMorningPost(client, marker, { clock } = {}) {
 // No `on:` filter: that resolves against Slack's timezone, so instead we sort newest
 // first and cut off at the user's midnight ourselves.
 export async function findTodayThreadAnchor(
-  client, { startMarker, finishMarker, anchorPhrase, preferredChannelId = null, clock }
+  client, { startMarker, finishMarker, anchorPhrase, preferredChannelId = null, channelName = null, clock }
 ) {
+  // With a channel name, only a thread in that channel counts: no fallback elsewhere.
+  const norm = (s) => String(s || '').trim().replace(/^#/, '').toLowerCase();
+  const strict = !!channelName;
+  const inChannel = (m) => (preferredChannelId && m.channel?.id === preferredChannelId)
+    || (channelName && norm(m.channel?.name) === norm(channelName));
   const since = startOfTodayEpoch(clock);
   const queries = [];
   if (anchorPhrase) queries.push(`"${anchorPhrase}"`);
@@ -160,17 +166,18 @@ export async function findTodayThreadAnchor(
       let hit = null;
 
       if (replyThreadTs) {
-        hit = { channelId: m.channel?.id, ts: replyThreadTs, viaReply: true, permalink: m.permalink };
+        hit = { channelId: m.channel?.id, channelName: m.channel?.name || null, ts: replyThreadTs, viaReply: true, permalink: m.permalink };
       } else {
         const text = (m.text || '').toLowerCase();
         const isAnchor = anchorPhrase && text.includes(anchorPhrase.toLowerCase());
         const hasBothMarkers =
           text.includes(startMarker.toLowerCase()) && text.includes(finishMarker.toLowerCase());
         if (isAnchor || hasBothMarkers) {
-          hit = { channelId: m.channel?.id, ts: m.ts, viaReply: false, permalink: m.permalink };
+          hit = { channelId: m.channel?.id, channelName: m.channel?.name || null, ts: m.ts, viaReply: false, permalink: m.permalink };
         }
       }
       if (!hit) continue;
+      if (strict) { if (inChannel(m)) return hit; continue; }
       // Prefer the channel the team actually posts these in, so an unrelated thread
       // that happens to quote the marker can't win.
       if (!preferredChannelId || hit.channelId === preferredChannelId) return hit;

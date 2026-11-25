@@ -40,8 +40,7 @@ import {
   setJiraStoryPointsField, setJiraIssueTypes, getTaskWeight, setTaskWeight, getPrefs, setPrefs, saveDailyStats, createJiraAuthState, getJiraAuthState,
   finishJiraAuthState, takeJiraAuthResult, deleteUserData,
   getJiraWatch, saveJiraWatch, deleteJiraWatch, markJiraChanged,
-  savePushSub, deletePushSub, pushSubsFor,
-} from './db.js';
+  savePushSub, deletePushSub, pushSubsFor, getPostChannel, setPostChannel, rememberPostChannelId, normChannel } from './db.js';
 import {
   makeClient, exchangeCode, whoAmI, findMorningPost, findLastPost,
   findTodayThreadAnchor, findMyReplyInThread, postMessage, todayISO,
@@ -796,7 +795,8 @@ app.get('/me/prefs', async (req, res) => {
   const auth = await requireAuth(req, res);
   if (!auth) return;
   try {
-    res.json(await getPrefs(auth.user.id));
+    const [prefs, ch] = await Promise.all([getPrefs(auth.user.id), getPostChannel(auth.user.id)]);
+    res.json({ ...prefs, postChannel: ch.name });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: e.message });
@@ -811,7 +811,17 @@ app.post('/me/prefs', async (req, res) => {
     for (const k of ['slackPosting', 'startReminder', 'finishReminder', 'punchInModal', 'punchOutModal']) {
       if (typeof req.body?.[k] === 'boolean') patch[k] = req.body[k];
     }
-    res.json(await setPrefs(auth.user.id, patch));
+    // The Slack channel daily updates go to (empty clears it, which stops posting).
+    if (typeof req.body?.postChannel === 'string') {
+      const name = normChannel(req.body.postChannel);
+      if (name && !/^[a-z0-9][a-z0-9._-]{0,79}$/.test(name)) {
+        return res.status(400).json({ error: 'That doesn’t look like a Slack channel name. Use the name as it appears in Slack, like frontend-daily-collaboration.' });
+      }
+      await setPostChannel(auth.user.id, name);
+    }
+    const [prefs, ch] = await Promise.all(
+      Object.keys(patch).length ? [setPrefs(auth.user.id, patch), getPostChannel(auth.user.id)] : [getPrefs(auth.user.id), getPostChannel(auth.user.id)]);
+    res.json({ ...prefs, postChannel: ch.name });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: e.message });
@@ -1035,6 +1045,36 @@ async function requireAuth(req, res) {
   return ctx;
 }
 
+// ---- Which channel this person may post to ----
+// Posting is set up for the frontend team's daily thread. Anyone else with the
+// extension can't post until they type their own team's channel in Settings.
+const NO_CHANNEL_MSG = 'Posting to Slack is set up for the frontend team’s daily thread. ' +
+  'To post from WorkLog, add your team’s channel in Settings › Modal.';
+// Does this channel (id, and name when Slack gave one) match the person's? Learns the
+// channel's id the first time its name matches, for the post check below.
+async function channelAllowed(user, ch, channelId, channelName, client = null) {
+  if (!ch.name || !channelId) return false;
+  if (ch.id && ch.id === channelId) return true;
+  // Search results usually carry the name; when they don't, ask Slack for it.
+  if (!channelName && client) {
+    try { channelName = (await client.conversations.info({ channel: channelId }))?.channel?.name || null; } catch { /* no channels:read */ }
+  }
+  if (channelName && normChannel(channelName) === ch.name) {
+    if (ch.id !== channelId) { await rememberPostChannelId(user.id, channelId).catch(() => {}); ch.id = channelId; }
+    return true;
+  }
+  return false;
+}
+// The last check before anything is posted.
+function postGuard(ch, channelId) {
+  if (!ch.name) return { status: 403, body: { error: NO_CHANNEL_MSG, code: 'no_channel' } };
+  if (!ch.id || ch.id !== channelId) {
+    return { status: 403, body: { code: 'wrong_channel',
+      error: `This thread isn’t in #${ch.name}, the channel set in Settings › Modal, so WorkLog won’t post there.` } };
+  }
+  return null;
+}
+
 // --- Find today's morning post (any channel) + parsed checklist items ---
 app.get('/day/today', async (req, res) => {
   const auth = await requireAuth(req, res);
@@ -1044,11 +1084,15 @@ app.get('/day/today', async (req, res) => {
     const user = auth.user || await (async () => { const m = await whoAmI(auth.client); return upsertUser(m.userId, m.user); })();
     const me = { userId: user.slack_user_id };
     // The Slack search and our own record of today, at the same time.
-    const [found, local] = await Promise.all([
+    const [found, local, ch] = await Promise.all([
       findMorningPost(auth.client, MARKER, { clock }),
       getDayLog(user.id, todayISO(clock)).catch(() => null),
+      getPostChannel(user.id),
     ]);
     let post = found;
+    // A morning post outside the person's channel isn't one to reply under.
+    const blockedFor = async (channelId, channelName) =>
+      (await channelAllowed(user, ch, channelId, channelName, auth.client)) ? null : (ch.name ? 'wrong_channel' : 'no_channel');
 
     // Slack's search index lags a few minutes, so a start-work post made moments ago
     // is invisible to it. Two search-free fallbacks before giving up:
@@ -1057,6 +1101,8 @@ app.get('/day/today', async (req, res) => {
       if (local?.start_post_ts && local.slack_thread_ts) {
         return res.json({
           found: true,
+          postBlocked: await blockedFor(local.slack_channel_id, null),
+          postChannel: ch.name,
           slackUserId: me.userId,
           channelId: local.slack_channel_id,
           threadTs: local.slack_thread_ts,
@@ -1077,7 +1123,7 @@ app.get('/day/today', async (req, res) => {
       // 2. Posted manually in Slack — read today's thread directly.
       const anchor = await findTodayThreadAnchor(auth.client, {
         startMarker: MARKER, finishMarker: FINISH_HEADER, anchorPhrase: THREAD_ANCHOR,
-        preferredChannelId: local?.slack_channel_id || null, clock,
+        preferredChannelId: ch.id || local?.slack_channel_id || null, channelName: ch.name, clock,
       });
       if (anchor) {
         post = await findMyReplyInThread(auth.client, {
@@ -1093,6 +1139,8 @@ app.get('/day/today', async (req, res) => {
     const parsed = await parseItems(post.text, MARKER);
     res.json({
       found: true,
+      postBlocked: await blockedFor(post.channelId, post.channelName || null),
+      postChannel: ch.name,
       slackUserId: me.userId,
       channelId: post.channelId,
       threadTs: post.threadTs,
@@ -1142,21 +1190,29 @@ app.get('/day/checkin', async (req, res) => {
   if (!auth) return;
   try {
     const clock = clockFromRequest(req);
-    const last = await findLastPost(auth.client, FINISH_HEADER, { clock });
+    const user = auth.user || await (async () => { const me = await whoAmI(auth.client); return upsertUser(me.userId, me.user); })();
+    const [last, ch] = await Promise.all([
+      findLastPost(auth.client, FINISH_HEADER, { clock }),
+      getPostChannel(user.id),
+    ]);
 
-    // Today's post belongs INSIDE the daily-updates thread, so the anchor decides
-    // both the channel and the thread to reply under.
-    const anchor = await findTodayThreadAnchor(auth.client, {
+    // Today's post belongs INSIDE the daily-updates thread of the person's channel.
+    // No channel set: still show the carried-over plan, but there's nowhere to post.
+    const anchor = ch.name ? await findTodayThreadAnchor(auth.client, {
       startMarker: MARKER,
       finishMarker: FINISH_HEADER,
       anchorPhrase: THREAD_ANCHOR,
-      preferredChannelId: last?.channelId || null, // where these normally get posted
+      preferredChannelId: ch.id,
+      channelName: ch.name,
       clock,
-    });
+    }) : null;
+    if (anchor) await channelAllowed(user, ch, anchor.channelId, anchor.channelName || ch.name);
 
     const carried = last ? carryOverItems(parseFinishItems(last.text)) : [];
     res.json({
       found: !!last,
+      postBlocked: ch.name ? null : 'no_channel',
+      postChannel: ch.name,
       header: START_HEADER,
       channelId: anchor?.channelId || null,
       threadTs: anchor?.ts || null,
@@ -1197,6 +1253,8 @@ app.post('/day/start', async (req, res) => {
 
     // Who: the session already says; ask Slack only for a session without a user row.
     const user = auth.user || await (async () => { const me = await whoAmI(auth.client); return upsertUser(me.userId, me.user); })();
+    const blocked = postGuard(await getPostChannel(user.id), channelId);
+    if (blocked) return res.status(blocked.status).json(blocked.body);
 
     const plan = items.map((it) => ({ ...it, status: null })); // plans post without icons
     const text = composeFinishMessage({ header: START_HEADER, items: plan, achievements: '' });
@@ -1232,6 +1290,8 @@ app.post('/day/post', async (req, res) => {
 
     // Who: the session already says; ask Slack only for a session without a user row.
     const user = auth.user || await (async () => { const me = await whoAmI(auth.client); return upsertUser(me.userId, me.user); })();
+    const blocked = postGuard(await getPostChannel(user.id), channelId);
+    if (blocked) return res.status(blocked.status).json(blocked.body);
 
     // Achievements post only when the user toggled it on. Mood is never posted.
     // Either way, both are stored in the DB below.
